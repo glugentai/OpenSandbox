@@ -106,6 +106,7 @@ class CodesAdapter(Codes):
         headers = {
             "User-Agent": self.connection_config.user_agent,
             **self.connection_config.headers,
+            **self.execd_endpoint.headers,
         }
 
         # Execd API does not require authentication
