@@ -35,6 +35,7 @@ public class ModelsTests
         execution.Results.Should().BeEmpty();
         execution.Error.Should().BeNull();
         execution.Complete.Should().BeNull();
+        execution.ExitCode.Should().BeNull();
     }
 
     [Fact]
@@ -307,13 +308,22 @@ public class ModelsTests
         {
             WorkingDirectory = "/home/user",
             Background = true,
-            TimeoutSeconds = 30
+            TimeoutSeconds = 30,
+            Uid = 1000,
+            Gid = 1000,
+            Envs = new Dictionary<string, string>
+            {
+                ["APP_ENV"] = "test"
+            }
         };
 
         // Assert
         options.WorkingDirectory.Should().Be("/home/user");
         options.Background.Should().BeTrue();
         options.TimeoutSeconds.Should().Be(30);
+        options.Uid.Should().Be(1000);
+        options.Gid.Should().Be(1000);
+        options.Envs.Should().ContainKey("APP_ENV");
     }
 
     [Fact]

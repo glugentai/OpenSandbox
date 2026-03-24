@@ -64,6 +64,7 @@ public class QuickStart {
         } catch (SandboxException e) {
             // Handle Sandbox specific exceptions
             System.err.println("Sandbox Error: [" + e.getError().getCode() + "] " + e.getError().getMessage());
+            System.err.println("Request ID: " + e.getRequestId());
         } catch (Exception e) {
             e.printStackTrace();
         }
@@ -91,6 +92,17 @@ sandbox.resume();
 // Get current status
 SandboxInfo info = sandbox.getInfo();
 System.out.println("State: " + info.getStatus().getState());
+System.out.println("Expires: " + info.getExpiresAt()); // null when manual cleanup mode is used
+```
+
+Create a non-expiring sandbox by passing `timeout(null)`:
+
+```java
+Sandbox manual = Sandbox.builder()
+    .connectionConfig(config)
+    .image("ubuntu")
+    .timeout(null)
+    .build();
 ```
 
 ### 2. Custom Health Check
@@ -203,6 +215,52 @@ sandboxes.getSandboxInfos().forEach(info -> {
 // manager.close();
 ```
 
+### 6. Sandbox Pool (Client-Side)
+
+Use `SandboxPool` to keep an idle buffer of ready sandboxes and reduce acquire latency.
+
+> ⚠ Experimental: `SandboxPool` is still evolving based on production feedback and may introduce breaking changes in future releases.
+
+```java
+import com.alibaba.opensandbox.sandbox.pool.SandboxPool;
+import com.alibaba.opensandbox.sandbox.domain.pool.PoolCreationSpec;
+import com.alibaba.opensandbox.sandbox.domain.pool.AcquirePolicy;
+import com.alibaba.opensandbox.sandbox.infrastructure.pool.InMemoryPoolStateStore;
+
+SandboxPool pool = SandboxPool.builder()
+    .poolName("demo-pool")
+    .ownerId("worker-1")
+    .maxIdle(3)
+    .stateStore(new InMemoryPoolStateStore()) // single-node store
+    .connectionConfig(config)
+    .creationSpec(
+        PoolCreationSpec.builder()
+            .image("ubuntu:22.04")
+            .entrypoint(java.util.List.of("tail", "-f", "/dev/null"))
+            .build()
+    )
+    .build();
+
+pool.start();
+Sandbox sb = pool.acquire(Duration.ofMinutes(10), AcquirePolicy.FAIL_FAST);
+try {
+    sb.commands().run("echo pool-ok");
+} finally {
+    sb.kill();
+    sb.close();
+}
+pool.shutdown(true);
+```
+
+Pool lifecycle semantics:
+- `acquire()` is only allowed when pool state is `RUNNING`.
+- In `DRAINING` / `STOPPED`, `acquire()` throws `PoolNotRunningException`.
+- `ownerId` is the lock owner identity (node/process id), not the pool identifier.
+  If omitted, SDK auto-generates a UUID-based default.
+
+
+> For distributed deployment, your application must provide a `PoolStateStore` implementation and ensure it satisfies distributed semantics (atomic idle take, idempotent put/remove, lock ownership/renewal, pool isolation, and consistent counters).
+
 ## Configuration
 
 ### 1. Connection Configuration
@@ -236,6 +294,10 @@ ConnectionPool sharedPool = new ConnectionPool(50, 30, TimeUnit.SECONDS);
 ConnectionConfig sharedConfig = ConnectionConfig.builder()
     .apiKey("your-key")
     .domain("api.opensandbox.io")
+    .headers(Map.of(
+        "X-Custom-Header", "value",
+        "X-Request-ID", "trace-123"
+    ))
     .connectionPool(sharedPool) // Inject shared pool
     .build();
 ```
@@ -254,6 +316,9 @@ The `Sandbox.builder()` allows configuring the sandbox environment.
 | `metadata`     | Custom metadata tags                     | Empty                           |
 | `networkPolicy` | Optional outbound network policy (egress) | -                             |
 | `readyTimeout` | Max time to wait for sandbox to be ready | 30 seconds                      |
+
+Note: metadata keys under `opensandbox.io/` are reserved for system-managed
+labels and will be rejected by the server.
 
 ```java
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.NetworkPolicy;
@@ -281,4 +346,26 @@ Sandbox sandbox = Sandbox.builder()
             .build()
     )
     .build();
+```
+
+### 3. Runtime Egress Policy Updates
+
+Runtime egress reads and patches go directly to the sandbox egress sidecar.
+The SDK first resolves the sandbox endpoint on port `18080`, then calls the sidecar `/policy` API.
+
+Patch uses merge semantics:
+- Incoming rules take priority over existing rules with the same `target`.
+- Existing rules for other targets remain unchanged.
+- Within a single patch payload, the first rule for a `target` wins.
+- The current `defaultAction` is preserved.
+
+```java
+NetworkPolicy policy = sandbox.getEgressPolicy();
+
+sandbox.patchEgressRules(
+    List.of(
+        NetworkRule.builder().action(NetworkRule.Action.ALLOW).target("www.github.com").build(),
+        NetworkRule.builder().action(NetworkRule.Action.DENY).target("pypi.org").build()
+    )
+);
 ```

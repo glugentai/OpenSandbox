@@ -20,7 +20,8 @@ from abc import ABC, abstractmethod
 from datetime import datetime
 from typing import Dict, List, Any, Optional
 
-from src.api.schema import Endpoint, ImageSpec, NetworkPolicy
+from src.api.schema import Endpoint, ImageSpec, NetworkPolicy, Volume
+from src.config import EGRESS_MODE_DNS
 
 
 class WorkloadProvider(ABC):
@@ -41,15 +42,19 @@ class WorkloadProvider(ABC):
         env: Dict[str, str],
         resource_limits: Dict[str, str],
         labels: Dict[str, str],
-        expires_at: datetime,
+        expires_at: Optional[datetime],
         execd_image: str,
         extensions: Optional[Dict[str, str]] = None,
         network_policy: Optional[NetworkPolicy] = None,
         egress_image: Optional[str] = None,
+        volumes: Optional[List[Volume]] = None,
+        annotations: Optional[Dict[str, str]] = None,
+        egress_auth_token: Optional[str] = None,
+        egress_mode: str = EGRESS_MODE_DNS,
     ) -> Dict[str, Any]:
         """
         Create a new workload resource.
-        
+
         Args:
             sandbox_id: Unique sandbox identifier
             namespace: Kubernetes namespace
@@ -58,17 +63,19 @@ class WorkloadProvider(ABC):
             env: Environment variables
             resource_limits: Resource limits (cpu, memory)
             labels: Labels to apply to the workload
-            expires_at: Expiration time
+            expires_at: Expiration time, or None for manual cleanup (no TTL)
             execd_image: execd daemon image
             extensions: General extension field for passing additional configuration.
                 This is a flexible field for various use cases (e.g., ``poolRef`` for pool-based creation).
             network_policy: Optional network policy for egress traffic control.
                 When provided, an egress sidecar container will be added to the Pod.
             egress_image: Optional egress sidecar image. Required when network_policy is provided.
-            
+            egress_mode: Sidecar ``OPENSANDBOX_EGRESS_MODE`` (from app ``[egress].mode`` when using network policy).
+            volumes: Optional list of volume mounts for the sandbox.
+
         Returns:
             Dict containing workload metadata (name, uid, etc.)
-            
+
         Raises:
             ApiException: If creation fails
         """
@@ -171,6 +178,15 @@ class WorkloadProvider(ABC):
             Endpoint object (including optional headers) or None if not available
         """
         pass
+
+    def supports_image_auth(self) -> bool:
+        """
+        Whether this provider supports per-request image pull authentication.
+
+        Providers that implement imagePullSecrets injection should override
+        this method to return True.
+        """
+        return False
 
     def legacy_resource_name(self, sandbox_id: str) -> str:
         """

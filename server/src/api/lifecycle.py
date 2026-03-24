@@ -21,11 +21,10 @@ All business logic is delegated to the service layer that backs each operation.
 
 from typing import List, Optional
 
-import httpx
 from fastapi import APIRouter, Header, Query, Request, status
-from fastapi.exceptions import HTTPException
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import Response
 
+from src.extensions import validate_extensions
 from src.api.schema import (
     CreateSandboxRequest,
     CreateSandboxResponse,
@@ -41,24 +40,6 @@ from src.api.schema import (
 )
 from src.services.factory import create_sandbox_service
 
-# RFC 2616 Section 13.5.1
-HOP_BY_HOP_HEADERS = {
-    "connection",
-    "keep-alive",
-    "proxy-authenticate",
-    "proxy-authorization",
-    "te",
-    "trailers",
-    "transfer-encoding",
-    "upgrade",
-}
-
-# Headers that shouldn't be forwarded to untrusted/internal backends
-SENSITIVE_HEADERS = {
-    "authorization",
-    "cookie",
-}
-
 # Initialize router
 router = APIRouter(tags=["Sandboxes"])
 
@@ -73,7 +54,6 @@ sandbox_service = create_sandbox_service()
 @router.post(
     "/sandboxes",
     response_model=CreateSandboxResponse,
-    response_model_exclude_none=True,
     status_code=status.HTTP_202_ACCEPTED,
     responses={
         202: {"description": "Sandbox creation accepted for asynchronous provisioning"},
@@ -104,15 +84,14 @@ async def create_sandbox(
     Raises:
         HTTPException: If sandbox creation scheduling fails
     """
-
-    return sandbox_service.create_sandbox(request)
+    validate_extensions(request.extensions)
+    return await sandbox_service.create_sandbox(request)
 
 
 # Search endpoint
 @router.get(
     "/sandboxes",
     response_model=ListSandboxesResponse,
-    response_model_exclude_none=True,
     responses={
         200: {"description": "Paginated collection of sandboxes"},
         400: {"model": ErrorResponse, "description": "The request was invalid or malformed"},
@@ -176,7 +155,6 @@ async def list_sandboxes(
 @router.get(
     "/sandboxes/{sandbox_id}",
     response_model=Sandbox,
-    response_model_exclude_none=True,
     responses={
         200: {"description": "Sandbox current state and metadata"},
         401: {"model": ErrorResponse, "description": "Authentication credentials are missing or invalid"},
@@ -416,72 +394,3 @@ async def get_sandbox_endpoint(
         endpoint.endpoint = f"{base_url}/sandboxes/{sandbox_id}/proxy/{port}"
 
     return endpoint
-
-
-@router.api_route(
-    "/sandboxes/{sandbox_id}/proxy/{port}/{full_path:path}",
-    methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
-)
-async def proxy_sandbox_endpoint_request(request: Request, sandbox_id: str, port: int, full_path: str):
-    """
-    Receives all incoming requests, determines the target sandbox from path parameter,
-    and asynchronously proxies the request to it.
-    """
-
-    endpoint = sandbox_service.get_endpoint(sandbox_id, port)
-
-    target_host = endpoint.endpoint
-    query_string = request.url.query
-    target_url = (
-        f"http://{target_host}/{full_path}?{query_string}"
-        if query_string
-        else f"http://{target_host}/{full_path}"
-    )
-
-    client: httpx.AsyncClient = request.app.state.http_client
-
-    try:
-        # Filter headers
-        headers = {}
-        for key, value in request.headers.items():
-            key_lower = key.lower()
-            if (
-                key_lower != "host"
-                and key_lower not in HOP_BY_HOP_HEADERS
-                and key_lower not in SENSITIVE_HEADERS
-            ):
-                headers[key] = value
-
-        req = client.build_request(
-            method=request.method,
-            url=target_url,
-            headers=headers,
-            content=request.stream(),
-        )
-
-        # TODO: support websocket protocol?
-        # since execd component does not have websocket handler currently, we just raise an error here
-        if request.method == "GET" and request.headers.get("Upgrade") == "websocket":
-            raise HTTPException(
-                status_code=400, detail="Websocket upgrade is not supported yet"
-            )
-
-        resp = await client.send(req, stream=True)
-
-        return StreamingResponse(
-            content=resp.aiter_bytes(),
-            status_code=resp.status_code,
-            headers=resp.headers,
-        )
-    except httpx.ConnectError as e:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Could not connect to the backend sandbox {endpoint}: {e}",
-        )
-    except HTTPException:
-        # Preserve explicit HTTP exceptions raised above (e.g. websocket upgrade not supported).
-        raise
-    except Exception as e:
-        raise HTTPException(
-            status_code=500, detail=f"An internal error occurred in the proxy: {e}"
-        )

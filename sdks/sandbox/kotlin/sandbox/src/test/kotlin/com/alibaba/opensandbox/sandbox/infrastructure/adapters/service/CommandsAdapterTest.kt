@@ -18,20 +18,29 @@ package com.alibaba.opensandbox.sandbox.infrastructure.adapters.service
 
 import com.alibaba.opensandbox.sandbox.HttpClientProvider
 import com.alibaba.opensandbox.sandbox.config.ConnectionConfig
+import com.alibaba.opensandbox.sandbox.domain.exceptions.SandboxApiException
 import com.alibaba.opensandbox.sandbox.domain.models.execd.executions.ExecutionHandlers
 import com.alibaba.opensandbox.sandbox.domain.models.execd.executions.RunCommandRequest
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SandboxEndpoint
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.booleanOrNull
+import kotlinx.serialization.json.intOrNull
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.assertThrows
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
 class CommandsAdapterTest {
+    // CommandsAdapter unit tests
     private lateinit var mockWebServer: MockWebServer
     private lateinit var commandsAdapter: CommandsAdapter
     private lateinit var httpClientProvider: HttpClientProvider
@@ -41,7 +50,6 @@ class CommandsAdapterTest {
         mockWebServer = MockWebServer()
         mockWebServer.start()
 
-        val baseUrl = mockWebServer.url("/").toString()
         // We need to parse the port from MockWebServer to simulate the Execd endpoint
         val host = mockWebServer.hostName
         val port = mockWebServer.port
@@ -54,7 +62,8 @@ class CommandsAdapterTest {
                 .build()
 
         httpClientProvider = HttpClientProvider(config)
-        commandsAdapter = CommandsAdapter(httpClientProvider, endpoint)
+        val sessionAdapter = SessionAdapter(httpClientProvider, endpoint)
+        commandsAdapter = CommandsAdapter(httpClientProvider, endpoint, sessionAdapter)
     }
 
     @AfterEach
@@ -93,17 +102,134 @@ class CommandsAdapterTest {
         val request =
             RunCommandRequest.builder()
                 .command("echo Hello")
+                .uid(1000)
+                .gid(1000)
+                .env("APP_ENV", "test")
+                .env("LOG_LEVEL", "debug")
                 .handlers(handlers)
                 .build()
 
-        commandsAdapter.run(request)
+        val execution = commandsAdapter.run(request)
 
         assertTrue(latch.await(2, TimeUnit.SECONDS), "Timed out waiting for completion event")
         assertEquals("Hello", receivedOutput.toString())
         assertEquals(100L, executionTime)
+        assertEquals(0, execution.exitCode)
+        assertEquals(100L, execution.complete?.executionTimeInMillis)
 
         val recordedRequest = mockWebServer.takeRequest()
         assertEquals("/command", recordedRequest.path)
         assertEquals("POST", recordedRequest.method)
+        val requestBodyJson = Json.parseToJsonElement(recordedRequest.body.readUtf8()).jsonObject
+        assertEquals("echo Hello", requestBodyJson["command"]?.jsonPrimitive?.content)
+        assertEquals(1000, requestBodyJson["uid"]?.jsonPrimitive?.intOrNull)
+        assertEquals(1000, requestBodyJson["gid"]?.jsonPrimitive?.intOrNull)
+        val envs = requestBodyJson["envs"]?.jsonObject
+        assertEquals("test", envs?.get("APP_ENV")?.jsonPrimitive?.content)
+        assertEquals("debug", envs?.get("LOG_LEVEL")?.jsonPrimitive?.content)
+        // Builder defaults background to false; request body always includes it
+        assertEquals(false, requestBodyJson["background"]?.jsonPrimitive?.booleanOrNull)
+    }
+
+    @Test
+    fun `run should infer non-zero exit code from command error event`() {
+        val initEvent = """{"type":"init","text":"cmd-123","timestamp":1672531200000}"""
+        val errorEvent =
+            """{"type":"error","error":{"ename":"CommandExecError","evalue":"7","traceback":["exit status 7"]},"timestamp":1672531201000}"""
+
+        mockWebServer.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setBody("$initEvent\n$errorEvent\n"),
+        )
+
+        val execution =
+            commandsAdapter.run(
+                RunCommandRequest.builder()
+                    .command("exit 7")
+                    .build(),
+            )
+
+        assertEquals("cmd-123", execution.id)
+        assertEquals(7, execution.exitCode)
+        assertEquals("CommandExecError", execution.error?.name)
+        assertEquals("7", execution.error?.value)
+        assertEquals(null, execution.complete)
+    }
+
+    @Test
+    fun `run should infer exit code from final execution state regardless of event order`() {
+        val initEvent = """{"type":"init","text":"cmd-123","timestamp":1672531200000}"""
+        val completeEvent = """{"type":"execution_complete","execution_time":100,"timestamp":1672531201000}"""
+        val errorEvent =
+            """{"type":"error","error":{"ename":"CommandExecError","evalue":"7","traceback":["exit status 7"]},"timestamp":1672531202000}"""
+
+        mockWebServer.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setBody("$initEvent\n$completeEvent\n$errorEvent\n"),
+        )
+
+        val execution =
+            commandsAdapter.run(
+                RunCommandRequest.builder()
+                    .command("exit 7")
+                    .build(),
+            )
+
+        assertEquals(7, execution.exitCode)
+        assertEquals(100L, execution.complete?.executionTimeInMillis)
+        assertEquals("7", execution.error?.value)
+    }
+
+    @Test
+    fun `run should keep exit code null when command error value is blank`() {
+        val initEvent = """{"type":"init","text":"cmd-123","timestamp":1672531200000}"""
+        val completeEvent = """{"type":"execution_complete","execution_time":100,"timestamp":1672531201000}"""
+        val errorEvent =
+            """{"type":"error","error":{"ename":"CommandExecError","evalue":"","traceback":["failed"]},"timestamp":1672531202000}"""
+
+        mockWebServer.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setBody("$initEvent\n$completeEvent\n$errorEvent\n"),
+        )
+
+        val execution =
+            commandsAdapter.run(
+                RunCommandRequest.builder()
+                    .command("bad command")
+                    .build(),
+            )
+
+        assertEquals(null, execution.exitCode)
+        assertEquals("", execution.error?.value)
+        assertEquals(100L, execution.complete?.executionTimeInMillis)
+    }
+
+    @Test
+    fun `run command builder should require uid when gid is provided`() {
+        assertThrows<IllegalArgumentException> {
+            RunCommandRequest.builder()
+                .command("id")
+                .gid(1000)
+                .build()
+        }
+    }
+
+    @Test
+    fun `run should expose request id on api exception`() {
+        mockWebServer.enqueue(
+            MockResponse()
+                .setResponseCode(500)
+                .addHeader("X-Request-ID", "req-kotlin-123")
+                .setBody("""{"code":"INTERNAL_ERROR","message":"boom"}"""),
+        )
+
+        val request = RunCommandRequest.builder().command("echo Hello").build()
+        val ex = assertThrows(SandboxApiException::class.java) { commandsAdapter.run(request) }
+
+        assertEquals(500, ex.statusCode)
+        assertEquals("req-kotlin-123", ex.requestId)
     }
 }

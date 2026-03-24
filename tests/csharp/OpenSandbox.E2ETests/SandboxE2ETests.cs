@@ -85,7 +85,68 @@ public class SandboxE2ETests : IClassFixture<SandboxE2ETestFixture>
     }
 
     [Fact(Timeout = 2 * 60 * 1000)]
-    public async Task Sandbox_Create_With_NetworkPolicy()
+    public async Task Sandbox_XRequestId_Passthrough_OnServerError()
+    {
+        var requestId = $"e2e-csharp-server-{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}";
+        var missingSandboxId = $"missing-{requestId}";
+        var baseConfig = _fixture.ConnectionConfig;
+        var config = new ConnectionConfig(new ConnectionConfigOptions
+        {
+            Domain = baseConfig.Domain,
+            Protocol = baseConfig.Protocol,
+            ApiKey = baseConfig.ApiKey,
+            RequestTimeoutSeconds = baseConfig.RequestTimeoutSeconds,
+            Headers = new Dictionary<string, string> { ["X-Request-ID"] = requestId }
+        });
+
+        var ex = await Assert.ThrowsAsync<SandboxApiException>(async () =>
+        {
+            var connected = await Sandbox.ConnectAsync(new SandboxConnectOptions
+            {
+                ConnectionConfig = config,
+                SandboxId = missingSandboxId
+            });
+            try
+            {
+                await connected.GetInfoAsync();
+            }
+            finally
+            {
+                await connected.DisposeAsync();
+            }
+        });
+
+        Assert.Equal(requestId, ex.RequestId);
+    }
+
+    [Fact(Timeout = 2 * 60 * 1000)]
+    public async Task Sandbox_ManualCleanup_Returns_Null_ExpiresAt()
+    {
+        var sandbox = await Sandbox.CreateAsync(new SandboxCreateOptions
+        {
+            ConnectionConfig = _fixture.ConnectionConfig,
+            Image = _fixture.DefaultImage,
+            ManualCleanup = true,
+            ReadyTimeoutSeconds = _fixture.DefaultReadyTimeoutSeconds,
+            Metadata = new Dictionary<string, string> { ["tag"] = "manual-csharp-e2e-test" }
+        });
+
+        try
+        {
+            var info = await sandbox.GetInfoAsync();
+            Assert.Null(info.ExpiresAt);
+            Assert.NotNull(info.Metadata);
+            Assert.Equal("manual-csharp-e2e-test", info.Metadata!["tag"]);
+        }
+        finally
+        {
+            await sandbox.KillAsync();
+            await sandbox.DisposeAsync();
+        }
+    }
+
+    [Fact(Timeout = 2 * 60 * 1000)]
+    public async Task Sandbox_Create_With_NetworkPolicy_Get_And_Patch_Egress()
     {
         var policySandbox = await Sandbox.CreateAsync(new SandboxCreateOptions
         {
@@ -102,11 +163,112 @@ public class SandboxE2ETests : IClassFixture<SandboxE2ETestFixture>
 
         try
         {
+            await Task.Delay(5000);
+
+            var initialPolicy = await policySandbox.GetEgressPolicyAsync();
+            Assert.NotNull(initialPolicy);
+            Assert.Equal(NetworkRuleAction.Deny, initialPolicy.DefaultAction);
+            Assert.NotNull(initialPolicy.Egress);
+            Assert.Contains(
+                initialPolicy.Egress!,
+                rule => rule.Target == "pypi.org" && rule.Action == NetworkRuleAction.Allow);
+
             var blocked = await policySandbox.Commands.RunAsync("curl -I https://www.github.com");
             Assert.NotNull(blocked.Error);
 
             var allowed = await policySandbox.Commands.RunAsync("curl -I https://pypi.org");
             Assert.Null(allowed.Error);
+
+            await policySandbox.PatchEgressRulesAsync(new List<NetworkRule>
+            {
+                new() { Action = NetworkRuleAction.Allow, Target = "www.github.com" },
+                new() { Action = NetworkRuleAction.Deny, Target = "pypi.org" }
+            });
+            await Task.Delay(2000);
+
+            var patchedPolicy = await policySandbox.GetEgressPolicyAsync();
+            Assert.NotNull(patchedPolicy.Egress);
+            Assert.Contains(
+                patchedPolicy.Egress!,
+                rule => rule.Target == "www.github.com" && rule.Action == NetworkRuleAction.Allow);
+            Assert.Contains(
+                patchedPolicy.Egress!,
+                rule => rule.Target == "pypi.org" && rule.Action == NetworkRuleAction.Deny);
+
+            var githubAllowed = await policySandbox.Commands.RunAsync("curl -I https://www.github.com");
+            Assert.Null(githubAllowed.Error);
+
+            var pypiDenied = await policySandbox.Commands.RunAsync("curl -I https://pypi.org");
+            Assert.NotNull(pypiDenied.Error);
+        }
+        finally
+        {
+            try
+            {
+                await policySandbox.KillAsync();
+            }
+            catch
+            {
+            }
+
+            await policySandbox.DisposeAsync();
+        }
+    }
+
+    [Fact(Timeout = 2 * 60 * 1000)]
+    public async Task Sandbox_Create_With_NetworkPolicy_Get_And_Patch_Egress_Via_ServerProxy()
+    {
+        var policySandbox = await Sandbox.CreateAsync(new SandboxCreateOptions
+        {
+            ConnectionConfig = _fixture.ServerProxyConnectionConfig,
+            Image = _fixture.DefaultImage,
+            TimeoutSeconds = _fixture.DefaultTimeoutSeconds,
+            ReadyTimeoutSeconds = _fixture.DefaultReadyTimeoutSeconds,
+            NetworkPolicy = new NetworkPolicy
+            {
+                DefaultAction = NetworkRuleAction.Deny,
+                Egress = new List<NetworkRule> { new() { Action = NetworkRuleAction.Allow, Target = "pypi.org" } }
+            }
+        });
+
+        try
+        {
+            await Task.Delay(5000);
+
+            var egressEndpoint = await policySandbox.GetEndpointAsync(Constants.DefaultEgressPort);
+            Assert.Contains(
+                $"/sandboxes/{policySandbox.Id}/proxy/{Constants.DefaultEgressPort}",
+                egressEndpoint.EndpointAddress);
+
+            var initialPolicy = await policySandbox.GetEgressPolicyAsync();
+            Assert.NotNull(initialPolicy);
+            Assert.Equal(NetworkRuleAction.Deny, initialPolicy.DefaultAction);
+            Assert.NotNull(initialPolicy.Egress);
+            Assert.Contains(
+                initialPolicy.Egress!,
+                rule => rule.Target == "pypi.org" && rule.Action == NetworkRuleAction.Allow);
+
+            var blocked = await policySandbox.Commands.RunAsync("curl -I https://www.github.com");
+            Assert.NotNull(blocked.Error);
+
+            var allowed = await policySandbox.Commands.RunAsync("curl -I https://pypi.org");
+            Assert.Null(allowed.Error);
+
+            await policySandbox.PatchEgressRulesAsync(new List<NetworkRule>
+            {
+                new() { Action = NetworkRuleAction.Allow, Target = "www.github.com" },
+                new() { Action = NetworkRuleAction.Deny, Target = "pypi.org" }
+            });
+            await Task.Delay(2000);
+
+            var patchedPolicy = await policySandbox.GetEgressPolicyAsync();
+            Assert.NotNull(patchedPolicy.Egress);
+            Assert.Contains(
+                patchedPolicy.Egress!,
+                rule => rule.Target == "www.github.com" && rule.Action == NetworkRuleAction.Allow);
+            Assert.Contains(
+                patchedPolicy.Egress!,
+                rule => rule.Target == "pypi.org" && rule.Action == NetworkRuleAction.Deny);
         }
         finally
         {
@@ -410,6 +572,9 @@ public class SandboxE2ETests : IClassFixture<SandboxE2ETestFixture>
         Assert.Single(echoResult.Logs.Stdout);
         Assert.Equal("Hello OpenSandbox E2E", echoResult.Logs.Stdout[0].Text);
         AssertRecentTimestampMs(echoResult.Logs.Stdout[0].Timestamp, 60_000);
+        Assert.Equal(0, echoResult.ExitCode);
+        Assert.NotNull(echoResult.Complete);
+        Assert.True(echoResult.Complete!.ExecutionTimeMs >= 0);
         AssertTerminalEventContract(initEvents, completedEvents, errors, echoResult.Id!);
 
         var pwdResult = await sandbox.Commands.RunAsync(
@@ -418,13 +583,16 @@ public class SandboxE2ETests : IClassFixture<SandboxE2ETestFixture>
         Assert.Null(pwdResult.Error);
         Assert.Single(pwdResult.Logs.Stdout);
         Assert.Equal("/tmp", pwdResult.Logs.Stdout[0].Text);
+        Assert.Equal(0, pwdResult.ExitCode);
+        Assert.NotNull(pwdResult.Complete);
 
         var start = DateTime.UtcNow;
-        await sandbox.Commands.RunAsync(
+        var backgroundResult = await sandbox.Commands.RunAsync(
             "sleep 30",
             options: new RunCommandOptions { Background = true });
         var elapsed = DateTime.UtcNow - start;
         Assert.True(elapsed.TotalSeconds < 10, "Background command should return quickly.");
+        Assert.Null(backgroundResult.ExitCode);
 
         stdoutMessages = new ConcurrentBag<OutputMessage>();
         stderrMessages = new ConcurrentBag<OutputMessage>();
@@ -449,6 +617,9 @@ public class SandboxE2ETests : IClassFixture<SandboxE2ETestFixture>
         Assert.Contains(
             failResult.Logs.Stderr,
             msg => msg.Text.Contains("nonexistent-command-that-does-not-exist", StringComparison.Ordinal));
+        Assert.Null(failResult.Complete);
+        Assert.NotNull(failResult.ExitCode);
+        Assert.Equal(int.Parse(failResult.Error.Value), failResult.ExitCode);
         AssertTerminalEventContract(initEvents, completedEvents, errors, failResult.Id!);
         Assert.Empty(completedEvents);
     }
@@ -486,6 +657,83 @@ public class SandboxE2ETests : IClassFixture<SandboxE2ETestFixture>
         var finalLogs = logsText.ToString();
         Assert.Contains("log-line-1", finalLogs, StringComparison.Ordinal);
         Assert.Contains("log-line-2", finalLogs, StringComparison.Ordinal);
+    }
+
+    [Fact(Timeout = 2 * 60 * 1000)]
+    public async Task Command_Env_Injection()
+    {
+        var sandbox = _fixture.Sandbox;
+        var envKey = "OPEN_SANDBOX_E2E_CMD_ENV";
+        var envValue = $"env-ok-{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}";
+        var probeCommand =
+            $"sh -c 'if [ -z \"${{{envKey}:-}}\" ]; then echo \"__EMPTY__\"; else echo \"${{{envKey}}}\"; fi'";
+
+        var baseline = await sandbox.Commands.RunAsync(probeCommand);
+        Assert.Null(baseline.Error);
+        var baselineOutput = string.Join("\n", baseline.Logs.Stdout.Select(m => m.Text)).Trim();
+        Assert.Equal("__EMPTY__", baselineOutput);
+
+        var injected = await sandbox.Commands.RunAsync(
+            probeCommand,
+            options: new RunCommandOptions
+            {
+                Envs = new Dictionary<string, string>
+                {
+                    [envKey] = envValue,
+                    ["OPEN_SANDBOX_E2E_SECOND_ENV"] = "second-ok"
+                }
+            });
+        Assert.Null(injected.Error);
+        var injectedOutput = string.Join("\n", injected.Logs.Stdout.Select(m => m.Text)).Trim();
+        Assert.Equal(envValue, injectedOutput);
+    }
+
+    [Fact(Timeout = 2 * 60 * 1000)]
+    public async Task Bash_Session_API_Cwd_And_Env_Persistence()
+    {
+        var sandbox = _fixture.Sandbox;
+
+        var sid = await sandbox.Commands.CreateSessionAsync(new CreateSessionOptions { Cwd = "/tmp" });
+        Assert.False(string.IsNullOrWhiteSpace(sid));
+
+        var run = await sandbox.Commands.RunInSessionAsync(sid, "pwd");
+        Assert.Null(run.Error);
+        var stdout = string.Join("", run.Logs.Stdout.Select(m => m.Text)).Trim();
+        Assert.Equal("/tmp", stdout);
+
+        run = await sandbox.Commands.RunInSessionAsync(
+            sid,
+            "pwd",
+            options: new RunInSessionOptions { Cwd = "/var" });
+        Assert.Null(run.Error);
+        stdout = string.Join("", run.Logs.Stdout.Select(m => m.Text)).Trim();
+        Assert.Equal("/var", stdout);
+
+        run = await sandbox.Commands.RunInSessionAsync(
+            sid,
+            "pwd",
+            options: new RunInSessionOptions { Cwd = "/tmp" });
+        Assert.Null(run.Error);
+        stdout = string.Join("", run.Logs.Stdout.Select(m => m.Text)).Trim();
+        Assert.Equal("/tmp", stdout);
+
+        run = await sandbox.Commands.RunInSessionAsync(sid, "export E2E_SESSION_ENV=session-env-ok");
+        Assert.Null(run.Error);
+
+        run = await sandbox.Commands.RunInSessionAsync(sid, "echo $E2E_SESSION_ENV");
+        Assert.Null(run.Error);
+        stdout = string.Join("", run.Logs.Stdout.Select(m => m.Text)).Trim();
+        Assert.Equal("session-env-ok", stdout);
+
+        var sid2 = await sandbox.Commands.CreateSessionAsync(new CreateSessionOptions { Cwd = "/var" });
+        Assert.False(string.IsNullOrWhiteSpace(sid2));
+        run = await sandbox.Commands.RunInSessionAsync(sid2, "pwd");
+        Assert.Null(run.Error);
+        stdout = string.Join("", run.Logs.Stdout.Select(m => m.Text)).Trim();
+        Assert.Equal("/var", stdout);
+
+        await sandbox.Commands.DeleteSessionAsync(sid);
+        await sandbox.Commands.DeleteSessionAsync(sid2);
     }
 
     [Fact(Timeout = 2 * 60 * 1000)]
@@ -802,6 +1050,7 @@ public sealed class SandboxE2ETestFixture : IAsyncLifetime
     private Sandbox? _sandbox;
 
     public ConnectionConfig ConnectionConfig => _baseFixture.ConnectionConfig;
+    public ConnectionConfig ServerProxyConnectionConfig => _baseFixture.ServerProxyConnectionConfig;
     public string DefaultImage => _baseFixture.DefaultImage;
     public int DefaultTimeoutSeconds => _baseFixture.DefaultTimeoutSeconds;
     public int DefaultReadyTimeoutSeconds => _baseFixture.DefaultReadyTimeoutSeconds;

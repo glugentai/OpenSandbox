@@ -25,6 +25,9 @@ from io import BytesIO
 
 import pytest
 from opensandbox import Sandbox
+from opensandbox.config import ConnectionConfig
+from opensandbox.constants import DEFAULT_EGRESS_PORT
+from opensandbox.exceptions import SandboxApiException
 from opensandbox.models.execd import (
     ExecutionComplete,
     ExecutionError,
@@ -41,11 +44,31 @@ from opensandbox.models.filesystem import (
     SetPermissionEntry,
     WriteEntry,
 )
-from opensandbox.models.sandboxes import Host, NetworkPolicy, NetworkRule, PVC, SandboxImageSpec, Volume
+from opensandbox.models.sandboxes import (
+    PVC,
+    Host,
+    NetworkPolicy,
+    NetworkRule,
+    SandboxImageSpec,
+    Volume,
+)
 
-from tests.base_e2e_test import create_connection_config, get_sandbox_image
+from tests.base_e2e_test import (
+    TEST_API_KEY,
+    TEST_DOMAIN,
+    TEST_PROTOCOL,
+    create_connection_config,
+    create_connection_config_server_proxy,
+    get_sandbox_image,
+    get_test_host_volume_dir,
+    get_test_pvc_name,
+    is_kubernetes_runtime,
+)
 
 logger = logging.getLogger(__name__)
+
+# Keep in sync with server ``src/extensions/keys.py``
+ACCESS_RENEW_EXTEND_SECONDS_KEY = "access.renew.extend.seconds"
 
 
 def _now_ms() -> int:
@@ -118,8 +141,7 @@ class TestSandboxE2E:
             sandbox = request.cls.sandbox
             if sandbox is not None:
                 try:
-                    # await sandbox.kill()
-                    pass
+                    await sandbox.kill()
                 except Exception as e:
                     logger.warning("Teardown: sandbox.kill() failed: %s", e, exc_info=True)
                 try:
@@ -142,7 +164,7 @@ class TestSandboxE2E:
         cls.sandbox = await Sandbox.create(
             image=SandboxImageSpec(get_sandbox_image()),
             connection_config=cls.connection_config,
-            timeout=timedelta(minutes=2),
+            timeout=timedelta(minutes=5),
             ready_timeout=timedelta(seconds=30),
             metadata={"tag": "e2e-test"},
             env={
@@ -181,17 +203,23 @@ class TestSandboxE2E:
         logger.info("Step 2: Get sandbox information")
         info = await sandbox.get_info()
         assert info.id == sandbox.id
-        assert info.status.state == "Running"
+        # FIXME: upstream Kubernetes BatchSandbox lifecycle may still report
+        # "Allocated" after execd health checks already pass. This E2E focuses
+        # on end-to-end usability, so tolerate that transient state here.
+        assert info.status.state in {"Running", "Allocated"}
         assert info.created_at is not None
         assert info.expires_at is not None
         assert info.expires_at > info.created_at
-        assert info.entrypoint == ["tail", "-f", "/dev/null"]
+        # Docker runtime reports the SDK default as-is; Kubernetes may prefix bootstrap.sh.
+        assert info.entrypoint[-3:] == ["tail", "-f", "/dev/null"], info.entrypoint
 
         duration = info.expires_at - info.created_at
+        # Matches Sandbox.create(..., timeout=timedelta(minutes=5)); allow skew across runtimes.
         min_duration = timedelta(minutes=1)
-        max_duration = timedelta(minutes=3)
-        assert min_duration <= duration <= max_duration, \
-            f"Duration {duration} should be between 1 and 3 minutes"
+        max_duration = timedelta(minutes=6)
+        assert min_duration <= duration <= max_duration, (
+            f"Duration {duration} should be between {min_duration} and {max_duration}"
+        )
 
         assert info.metadata is not None
         assert info.metadata.get("tag") == "e2e-test"
@@ -237,7 +265,7 @@ class TestSandboxE2E:
         renewed_info = await sandbox.get_info()
         assert renewed_info.expires_at > info.expires_at
         assert renewed_info.id == sandbox.id
-        assert renewed_info.status.state == "Running"
+        assert renewed_info.status.state in {"Running", "Allocated"}
 
         # The renew API should return the new expiration time. Allow small backend-side skew.
         assert abs((renewed_info.expires_at - renew_response.expires_at).total_seconds()) < 10
@@ -277,12 +305,34 @@ class TestSandboxE2E:
         finally:
             await sandbox2.close()
 
+    @pytest.mark.timeout(120)
+    @pytest.mark.order(1)
+    async def test_01b_manual_cleanup(self):
+        sandbox = await Sandbox.create(
+            image=SandboxImageSpec(get_sandbox_image()),
+            connection_config=TestSandboxE2E.connection_config,
+            timeout=None,
+            ready_timeout=timedelta(seconds=30),
+            metadata={"tag": "manual-e2e-test"},
+        )
+        try:
+            info = await sandbox.get_info()
+            assert info.expires_at is None
+            assert info.metadata is not None
+            assert info.metadata.get("tag") == "manual-e2e-test"
+        finally:
+            await sandbox.kill()
+            await sandbox.close()
+
         logger.info("TEST 1 PASSED: Sandbox lifecycle and health test completed successfully")
 
 
     @pytest.mark.timeout(120)
     @pytest.mark.order(1)
     async def test_01a_network_policy_create(self):
+        if is_kubernetes_runtime():
+            pytest.skip("Network policy is not covered in the Kubernetes runtime suite")
+
         logger.info("=" * 80)
         logger.info("TEST 1a: Creating sandbox with networkPolicy (async)")
         logger.info("=" * 80)
@@ -291,7 +341,7 @@ class TestSandboxE2E:
         sandbox = await Sandbox.create(
             image=SandboxImageSpec(get_sandbox_image()),
             connection_config=cfg,
-            timeout=timedelta(minutes=2),
+            timeout=timedelta(minutes=5),
             ready_timeout=timedelta(seconds=30),
             network_policy=NetworkPolicy(
                 defaultAction="deny",
@@ -311,22 +361,185 @@ class TestSandboxE2E:
                 pass
             await sandbox.close()
 
+    @pytest.mark.timeout(180)
+    @pytest.mark.order(1)
+    async def test_01aa_network_policy_get_and_patch(self):
+        if is_kubernetes_runtime():
+            pytest.skip("Network policy is not covered in the Kubernetes runtime suite")
+
+        logger.info("=" * 80)
+        logger.info("TEST 1aa: networkPolicy get/patch (async)")
+        logger.info("=" * 80)
+
+        cfg = create_connection_config()
+        sandbox = await Sandbox.create(
+            image=SandboxImageSpec(get_sandbox_image()),
+            connection_config=cfg,
+            timeout=timedelta(minutes=5),
+            ready_timeout=timedelta(seconds=30),
+            network_policy=NetworkPolicy(
+                defaultAction="deny",
+                egress=[NetworkRule(action="allow", target="pypi.org")],
+            ),
+        )
+        try:
+            await asyncio.sleep(5)
+
+            # Verify get egress policy right after create.
+            policy = await sandbox.get_egress_policy()
+            assert policy.default_action == "deny"
+            assert policy.egress is not None
+            assert any(rule.target == "pypi.org" and rule.action == "allow" for rule in policy.egress)
+
+            # Baseline behavior: github blocked, pypi allowed.
+            blocked = await sandbox.commands.run("curl -I https://www.github.com")
+            assert blocked.error is not None
+            allowed = await sandbox.commands.run("curl -I https://pypi.org")
+            assert allowed.error is None
+
+            # Patch policy: allow github, deny pypi.
+            await sandbox.patch_egress_rules(
+                [
+                    NetworkRule(action="allow", target="www.github.com"),
+                    NetworkRule(action="deny", target="pypi.org"),
+                ],
+            )
+            await asyncio.sleep(2)
+
+            patched_policy = await sandbox.get_egress_policy()
+            assert patched_policy.egress is not None
+            assert any(
+                rule.target == "www.github.com" and rule.action == "allow"
+                for rule in patched_policy.egress
+            )
+            assert any(
+                rule.target == "pypi.org" and rule.action == "deny"
+                for rule in patched_policy.egress
+            )
+
+            # Behavior after patch should be flipped.
+            github_allowed = await sandbox.commands.run("curl -I https://www.github.com")
+            assert github_allowed.error is None
+            pypi_denied = await sandbox.commands.run("curl -I https://pypi.org")
+            assert pypi_denied.error is not None
+        finally:
+            try:
+                await sandbox.kill()
+            except Exception:
+                pass
+            await sandbox.close()
+
+    @pytest.mark.timeout(240)
+    @pytest.mark.order(1)
+    async def test_01ab_network_policy_get_and_patch_with_server_proxy(self):
+        """Also covers access renew on proxy traffic (needs ``[renew_intent] enabled = true``)."""
+        if is_kubernetes_runtime():
+            pytest.skip("Network policy is not covered in the Kubernetes runtime suite")
+
+        logger.info("=" * 80)
+        logger.info("TEST 1ab: networkPolicy get/patch with server proxy (async)")
+        logger.info("=" * 80)
+
+        cfg = create_connection_config_server_proxy()
+        assert cfg.use_server_proxy is True
+        sandbox_ttl = timedelta(minutes=4)
+        sandbox = await Sandbox.create(
+            image=SandboxImageSpec(get_sandbox_image()),
+            connection_config=cfg,
+            timeout=sandbox_ttl,
+            ready_timeout=timedelta(seconds=90),
+            extensions={ACCESS_RENEW_EXTEND_SECONDS_KEY: "300"},
+            network_policy=NetworkPolicy(
+                defaultAction="deny",
+                egress=[NetworkRule(action="allow", target="pypi.org")],
+            ),
+        )
+        try:
+            boot = await sandbox.get_info()
+            assert boot.expires_at is not None
+            # Baseline from create contract only: ready/ping may already move expires_at.
+            nominal_expires_at = boot.created_at + sandbox_ttl
+
+            await asyncio.sleep(5)
+
+            egress_endpoint = await sandbox.get_endpoint(DEFAULT_EGRESS_PORT)
+            assert f"/sandboxes/{sandbox.id}/proxy/{DEFAULT_EGRESS_PORT}" in egress_endpoint.endpoint
+
+            policy = await sandbox.get_egress_policy()
+            assert policy.default_action == "deny"
+            assert policy.egress is not None
+            assert any(rule.target == "pypi.org" and rule.action == "allow" for rule in policy.egress)
+
+            blocked = await sandbox.commands.run("curl -I https://www.github.com")
+            assert blocked.error is not None
+            allowed = await sandbox.commands.run("curl -I https://pypi.org")
+            assert allowed.error is None
+
+            await sandbox.patch_egress_rules(
+                [
+                    NetworkRule(action="allow", target="www.github.com"),
+                    NetworkRule(action="deny", target="pypi.org"),
+                ],
+            )
+            await asyncio.sleep(2)
+
+            patched_policy = await sandbox.get_egress_policy()
+            assert patched_policy.egress is not None
+            assert any(
+                rule.target == "www.github.com" and rule.action == "allow"
+                for rule in patched_policy.egress
+            )
+            assert any(
+                rule.target == "pypi.org" and rule.action == "deny"
+                for rule in patched_policy.egress
+            )
+
+            assert await sandbox.is_healthy()
+
+            deadline = time.monotonic() + 30.0
+            min_delta = timedelta(seconds=30)
+            bumped = False
+            while time.monotonic() < deadline:
+                info = await sandbox.get_info()
+                if info.expires_at is not None and info.expires_at > nominal_expires_at + min_delta:
+                    bumped = True
+                    logger.info(
+                        "Access renew: expires_at=%s above nominal (created_at+timeout)=%s",
+                        info.expires_at,
+                        nominal_expires_at,
+                    )
+                    break
+                await asyncio.sleep(2.0)
+            assert bumped, (
+                "expires_at did not exceed created_at + create timeout + slack after proxied traffic; "
+                "set [renew_intent] enabled = true on the lifecycle server."
+            )
+        finally:
+            try:
+                await sandbox.kill()
+            except Exception:
+                pass
+            await sandbox.close()
+
     @pytest.mark.timeout(120)
     @pytest.mark.order(1)
     async def test_01b_host_volume_mount(self):
         """Test creating a sandbox with a host volume mount."""
+        if is_kubernetes_runtime():
+            pytest.skip("Host path volume E2E is only covered in the Docker runtime suite")
+
         logger.info("=" * 80)
         logger.info("TEST 1b: Creating sandbox with host volume mount (async)")
         logger.info("=" * 80)
 
-        host_dir = "/tmp/opensandbox-e2e/host-volume-test"
+        host_dir = get_test_host_volume_dir()
         container_mount_path = "/mnt/host-data"
 
         cfg = create_connection_config()
         sandbox = await Sandbox.create(
             image=SandboxImageSpec(get_sandbox_image()),
             connection_config=cfg,
-            timeout=timedelta(minutes=2),
+            timeout=timedelta(minutes=5),
             ready_timeout=timedelta(seconds=30),
             volumes=[
                 Volume(
@@ -383,18 +596,21 @@ class TestSandboxE2E:
     @pytest.mark.order(1)
     async def test_01c_host_volume_mount_readonly(self):
         """Test creating a sandbox with a read-only host volume mount."""
+        if is_kubernetes_runtime():
+            pytest.skip("Host path volume E2E is only covered in the Docker runtime suite")
+
         logger.info("=" * 80)
         logger.info("TEST 1c: Creating sandbox with read-only host volume mount (async)")
         logger.info("=" * 80)
 
-        host_dir = "/tmp/opensandbox-e2e/host-volume-test"
+        host_dir = get_test_host_volume_dir()
         container_mount_path = "/mnt/host-data-ro"
 
         cfg = create_connection_config()
         sandbox = await Sandbox.create(
             image=SandboxImageSpec(get_sandbox_image()),
             connection_config=cfg,
-            timeout=timedelta(minutes=2),
+            timeout=timedelta(minutes=5),
             ready_timeout=timedelta(seconds=30),
             volumes=[
                 Volume(
@@ -439,14 +655,14 @@ class TestSandboxE2E:
         logger.info("TEST 1d: Creating sandbox with PVC named volume mount (async)")
         logger.info("=" * 80)
 
-        pvc_volume_name = "opensandbox-e2e-pvc-test"
+        pvc_volume_name = get_test_pvc_name()
         container_mount_path = "/mnt/pvc-data"
 
         cfg = create_connection_config()
         sandbox = await Sandbox.create(
             image=SandboxImageSpec(get_sandbox_image()),
             connection_config=cfg,
-            timeout=timedelta(minutes=2),
+            timeout=timedelta(minutes=5),
             ready_timeout=timedelta(seconds=30),
             volumes=[
                 Volume(
@@ -506,14 +722,14 @@ class TestSandboxE2E:
         logger.info("TEST 1e: Creating sandbox with read-only PVC named volume mount (async)")
         logger.info("=" * 80)
 
-        pvc_volume_name = "opensandbox-e2e-pvc-test"
+        pvc_volume_name = get_test_pvc_name()
         container_mount_path = "/mnt/pvc-data-ro"
 
         cfg = create_connection_config()
         sandbox = await Sandbox.create(
             image=SandboxImageSpec(get_sandbox_image()),
             connection_config=cfg,
-            timeout=timedelta(minutes=2),
+            timeout=timedelta(minutes=5),
             ready_timeout=timedelta(seconds=30),
             volumes=[
                 Volume(
@@ -558,14 +774,14 @@ class TestSandboxE2E:
         logger.info("TEST 1f: Creating sandbox with PVC named volume subPath mount (async)")
         logger.info("=" * 80)
 
-        pvc_volume_name = "opensandbox-e2e-pvc-test"
+        pvc_volume_name = get_test_pvc_name()
         container_mount_path = "/mnt/train"
 
         cfg = create_connection_config()
         sandbox = await Sandbox.create(
             image=SandboxImageSpec(get_sandbox_image()),
             connection_config=cfg,
-            timeout=timedelta(minutes=2),
+            timeout=timedelta(minutes=5),
             ready_timeout=timedelta(seconds=30),
             volumes=[
                 Volume(
@@ -689,6 +905,10 @@ class TestSandboxE2E:
         assert echo_result.logs.stdout[0].is_error is False
         _assert_recent_timestamp_ms(echo_result.logs.stdout[0].timestamp)
         assert len(echo_result.logs.stderr) == 0
+        assert echo_result.exit_code == 0
+        assert echo_result.complete is not None
+        assert echo_result.complete.execution_time_in_millis >= 0
+        _assert_recent_timestamp_ms(echo_result.complete.timestamp)
 
         # Verify handlers captured events
         assert len(init_events) == 1, "Execution should have exactly one init event"
@@ -727,11 +947,13 @@ class TestSandboxE2E:
         assert pwd_result.logs.stdout[0].text == "/tmp"
         assert pwd_result.logs.stdout[0].is_error is False
         _assert_recent_timestamp_ms(pwd_result.logs.stdout[0].timestamp)
+        assert pwd_result.exit_code == 0
+        assert pwd_result.complete is not None
         logger.info(f"✓ PWD command executed: {pwd_result}")
 
         logger.info("Step 3: Background command")
         start_time = time.time()
-        await sandbox.commands.run(
+        background_result = await sandbox.commands.run(
             "sleep 30",
             opts=RunCommandOpts(background=True),
         )
@@ -740,6 +962,7 @@ class TestSandboxE2E:
         execution_time = (end_time - start_time) * 1000
         assert execution_time < 10000, \
             f"Background command should return quickly, but took {execution_time} ms"
+        assert background_result.exit_code is None
         logger.info(f"✓ Background command returned in {execution_time:.2f} ms")
 
         logger.info("Step 4: Test failing command")
@@ -766,6 +989,8 @@ class TestSandboxE2E:
         )
         assert all(m.is_error is True for m in fail_result.logs.stderr)
         _assert_recent_timestamp_ms(fail_result.logs.stderr[0].timestamp)
+        assert fail_result.complete is None
+        assert fail_result.exit_code == int(fail_result.error.value)
 
         # Verify handlers captured error events
         assert len(init_events) == 1, "Execution should have exactly one init event"
@@ -784,6 +1009,67 @@ class TestSandboxE2E:
         logger.info(f"✓ Failed command result: {fail_result}")
 
         logger.info("TEST 2 PASSED: Basic command execution test completed successfully")
+
+    @pytest.mark.timeout(120)
+    @pytest.mark.order(2)
+    async def test_02c_bash_session_api(self):
+        """Test create_session / run_in_session / delete_session: verify cwd is passed and applied.
+        Current execd session API supports cwd only (no env); this test asserts cwd for both
+        create_session and run_in_session.
+        """
+        await self._ensure_sandbox_created()
+        sandbox = TestSandboxE2E.sandbox
+
+        logger.info("=" * 80)
+        logger.info("TEST 2c: Bash session API — verify cwd is passed and applied")
+        logger.info("=" * 80)
+
+        logger.info("Step 1: Create session with cwd=/tmp and verify session starts in that directory")
+        sid = await sandbox.commands.create_session(cwd="/tmp")
+        assert sid is not None and isinstance(sid, str) and len(sid) > 0
+        out_pwd = await sandbox.commands.run_in_session(sid, "pwd")
+        assert out_pwd.error is None, f"pwd failed: {out_pwd.error}"
+        pwd_line = "".join(m.text for m in out_pwd.logs.stdout).strip()
+        assert pwd_line == "/tmp", f"create_session(cwd=/tmp) should run in /tmp, got: {pwd_line!r}"
+        logger.info("✓ create_session(cwd=/tmp) applied: pwd => %s", pwd_line)
+
+        logger.info("Step 2: run_in_session with cwd override — run in /var and verify")
+        out_var = await sandbox.commands.run_in_session(sid, "pwd", cwd="/var")
+        assert out_var.error is None
+        var_line = "".join(m.text for m in out_var.logs.stdout).strip()
+        assert var_line == "/var", f"run_in_session(..., cwd=/var) should run in /var, got: {var_line!r}"
+        logger.info("✓ run_in_session(..., cwd=/var) applied: pwd => %s", var_line)
+
+        logger.info("Step 3: run_in_session with cwd=/tmp — verify override per run")
+        out_tmp = await sandbox.commands.run_in_session(sid, "pwd", cwd="/tmp")
+        assert out_tmp.error is None
+        tmp_line = "".join(m.text for m in out_tmp.logs.stdout).strip()
+        assert tmp_line == "/tmp", f"run_in_session(..., cwd=/tmp) should run in /tmp, got: {tmp_line!r}"
+        logger.info("✓ run_in_session(..., cwd=/tmp) applied: pwd => %s", tmp_line)
+
+        logger.info("Step 3b: Export env in one run, read in next run — verify session state (env) persists")
+        await sandbox.commands.run_in_session(sid, "export E2E_SESSION_ENV=session-env-ok")
+        out_env = await sandbox.commands.run_in_session(sid, "echo $E2E_SESSION_ENV")
+        assert out_env.error is None
+        env_line = "".join(m.text for m in out_env.logs.stdout).strip()
+        assert env_line == "session-env-ok", f"env set in previous run should be visible, got: {env_line!r}"
+        logger.info("✓ session env persists across run_in_session: echo $E2E_SESSION_ENV => %s", env_line)
+
+        logger.info("Step 4: New session with cwd=/var — verify create_session cwd again")
+        sid2 = await sandbox.commands.create_session(cwd="/var")
+        assert sid2 is not None
+        out_var2 = await sandbox.commands.run_in_session(sid2, "pwd")
+        assert out_var2.error is None
+        var2_line = "".join(m.text for m in out_var2.logs.stdout).strip()
+        assert var2_line == "/var", f"create_session(cwd=/var) should run in /var, got: {var2_line!r}"
+        logger.info("✓ create_session(cwd=/var) applied: pwd => %s", var2_line)
+
+        logger.info("Step 5: Delete both sessions")
+        await sandbox.commands.delete_session(sid)
+        await sandbox.commands.delete_session(sid2)
+        logger.info("✓ Sessions deleted")
+
+        logger.info("TEST 2c PASSED: cwd passing verified for create_session and run_in_session")
 
     @pytest.mark.timeout(120)
     @pytest.mark.order(3)
@@ -815,6 +1101,40 @@ class TestSandboxE2E:
 
         assert "log-line-1" in logs_text
         assert "log-line-2" in logs_text
+
+    @pytest.mark.timeout(120)
+    @pytest.mark.order(3)
+    async def test_02b_run_command_with_envs(self):
+        """Test run_command env injection via RunCommandOpts.envs."""
+        await self._ensure_sandbox_created()
+        sandbox = TestSandboxE2E.sandbox
+
+        env_key = "OPEN_SANDBOX_E2E_CMD_ENV"
+        env_value = f"env-ok-{int(time.time())}"
+        probe_command = (
+            f"sh -c 'if [ -z \"${{{env_key}:-}}\" ]; then echo \"__EMPTY__\"; "
+            f"else echo \"${{{env_key}}}\"; fi'"
+        )
+
+        # Baseline: variable should be empty when not injected.
+        baseline = await sandbox.commands.run(probe_command)
+        assert baseline.error is None
+        baseline_output = "\n".join(msg.text for msg in baseline.logs.stdout).strip()
+        assert baseline_output == "__EMPTY__"
+
+        # Inject environment variables for this command only.
+        injected = await sandbox.commands.run(
+            probe_command,
+            opts=RunCommandOpts(
+                envs={
+                    env_key: env_value,
+                    "OPEN_SANDBOX_E2E_SECOND_ENV": "second-ok",
+                }
+            ),
+        )
+        assert injected.error is None
+        injected_output = "\n".join(msg.text for msg in injected.logs.stdout).strip()
+        assert injected_output == env_value
 
     @pytest.mark.timeout(120)
     @pytest.mark.order(4)
@@ -1108,6 +1428,9 @@ class TestSandboxE2E:
     @pytest.mark.order(6)
     async def test_05_sandbox_pause(self):
         """Test sandbox pause operation."""
+        if is_kubernetes_runtime():
+            pytest.skip("Pause is not supported by the Kubernetes runtime")
+
         await self._ensure_sandbox_created()
         sandbox = TestSandboxE2E.sandbox
 
@@ -1162,6 +1485,9 @@ class TestSandboxE2E:
     @pytest.mark.order(7)
     async def test_06_sandbox_resume(self):
         """Test sandbox resume operation."""
+        if is_kubernetes_runtime():
+            pytest.skip("Resume is not supported by the Kubernetes runtime")
+
         await self._ensure_sandbox_created()
         sandbox = TestSandboxE2E.sandbox
 
@@ -1217,3 +1543,21 @@ class TestSandboxE2E:
         elapsed_time = (time.time() - start_time) * 1000
         logger.info(f"✓ Sandbox resume completed in {elapsed_time:.2f} ms")
         logger.info("TEST 5 PASSED: Sandbox resume operation test completed successfully")
+
+    @pytest.mark.timeout(120)
+    @pytest.mark.order(8)
+    async def test_07_x_request_id_passthrough_on_server_error(self):
+        request_id = f"e2e-py-server-{int(time.time() * 1000)}"
+        missing_sandbox_id = f"missing-{request_id}"
+        cfg = ConnectionConfig(
+            domain=TEST_DOMAIN,
+            api_key=TEST_API_KEY,
+            request_timeout=timedelta(minutes=3),
+            protocol=TEST_PROTOCOL,
+            headers={"X-Request-ID": request_id},
+        )
+
+        with pytest.raises(SandboxApiException) as ei:
+            connected = await Sandbox.connect(sandbox_id=missing_sandbox_id, connection_config=cfg)
+            await connected.get_info()
+        assert ei.value.request_id == request_id

@@ -18,6 +18,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 
 import pytest
+from httpx import HTTPStatusError, Request, Response
 
 from opensandbox.adapters.converter.exception_converter import (
     ExceptionConverter,
@@ -32,10 +33,14 @@ from opensandbox.adapters.converter.filesystem_model_converter import (
 from opensandbox.adapters.converter.metrics_model_converter import (
     MetricsModelConverter,
 )
-from opensandbox.adapters.converter.response_handler import handle_api_error
+from opensandbox.adapters.converter.response_handler import (
+    handle_api_error,
+    require_parsed,
+)
 from opensandbox.adapters.converter.sandbox_model_converter import (
     SandboxModelConverter,
 )
+from opensandbox.api.lifecycle.errors import UnexpectedStatus
 from opensandbox.exceptions import (
     InvalidArgumentException,
     SandboxApiException,
@@ -59,6 +64,14 @@ def test_parse_sandbox_error_from_plain_text_string() -> None:
     assert err.message == "not-json"
 
 
+def test_parse_sandbox_error_from_invalid_utf8_bytes_fallback_message() -> None:
+    err = parse_sandbox_error(b"\xff\xfe")
+    assert err is not None
+    assert err.code == "UNEXPECTED_RESPONSE"
+    assert err.message is not None
+    assert "\ufffd" in err.message
+
+
 def test_handle_api_error_raises_with_parsed_message() -> None:
     class Parsed:
         message = "bad request"
@@ -66,10 +79,12 @@ def test_handle_api_error_raises_with_parsed_message() -> None:
     class Resp:
         status_code = 400
         parsed = Parsed()
+        headers = {"X-Request-ID": "req-123"}
 
     with pytest.raises(SandboxApiException) as ei:
         handle_api_error(Resp(), "Op")
     assert "bad request" in str(ei.value)
+    assert ei.value.request_id == "req-123"
 
 
 def test_handle_api_error_noop_on_success() -> None:
@@ -80,12 +95,51 @@ def test_handle_api_error_noop_on_success() -> None:
     handle_api_error(Resp(), "Op")
 
 
+def test_require_parsed_includes_request_id_on_invalid_payload() -> None:
+    class Resp:
+        status_code = 200
+        parsed = None
+        headers = {"x-request-id": "req-456"}
+
+    with pytest.raises(SandboxApiException) as ei:
+        require_parsed(Resp(), expected_type=str, operation_name="Op")
+    assert ei.value.request_id == "req-456"
+
+
 def test_exception_converter_maps_common_types() -> None:
     se = ExceptionConverter.to_sandbox_exception(ValueError("x"))
     assert isinstance(se, InvalidArgumentException)
 
     se2 = ExceptionConverter.to_sandbox_exception(OSError("x"))
     assert isinstance(se2, SandboxInternalException)
+
+
+def test_exception_converter_maps_generated_unexpected_status_to_api_exception() -> (
+    None
+):
+    err = UnexpectedStatus(400, b'{"code":"X","message":"bad"}')
+
+    converted = ExceptionConverter.to_sandbox_exception(err)
+
+    assert isinstance(converted, SandboxApiException)
+    assert converted.status_code == 400
+    assert converted.error is not None
+    assert converted.error.code == "X"
+
+
+def test_exception_converter_maps_httpx_status_error_to_api_exception() -> None:
+    request = Request("GET", "https://example.test")
+    response = Response(
+        502, request=request, content=b'{"code":"UPSTREAM","message":"gateway"}'
+    )
+    err = HTTPStatusError("bad gateway", request=request, response=response)
+
+    converted = ExceptionConverter.to_sandbox_exception(err)
+
+    assert isinstance(converted, SandboxApiException)
+    assert converted.status_code == 502
+    assert converted.error is not None
+    assert converted.error.code == "UPSTREAM"
 
 
 def test_execution_converter_to_api_run_command_request() -> None:
@@ -115,7 +169,31 @@ def test_execution_converter_to_api_run_command_request() -> None:
     assert d3["command"] == "sleep 10"
     assert d3["timeout"] == 60_000
     # timeout omitted when not set (backward compat)
-    assert "timeout" not in ExecutionConverter.to_api_run_command_request("x", RunCommandOpts()).to_dict()
+    assert (
+        "timeout"
+        not in ExecutionConverter.to_api_run_command_request(
+            "x", RunCommandOpts()
+        ).to_dict()
+    )
+
+    api4 = ExecutionConverter.to_api_run_command_request(
+        "id",
+        RunCommandOpts(
+            uid=1000,
+            gid=1000,
+            envs={"APP_ENV": "test", "LOG_LEVEL": "debug"},
+        ),
+    )
+    d4 = api4.to_dict()
+    assert d4["uid"] == 1000
+    assert d4["gid"] == 1000
+    assert d4["envs"] == {"APP_ENV": "test", "LOG_LEVEL": "debug"}
+    assert "cwd" not in d4
+
+
+def test_run_command_opts_validates_gid_requires_uid() -> None:
+    with pytest.raises(ValueError, match="uid is required when gid is provided"):
+        RunCommandOpts(gid=1000)
 
 
 def test_filesystem_and_metrics_converters() -> None:
@@ -135,7 +213,13 @@ def test_filesystem_and_metrics_converters() -> None:
     entry = FilesystemModelConverter.to_entry_info(fi)
     assert entry.path == "/a"
 
-    api_metrics = Metrics(cpu_count=1.0, cpu_used_pct=2.0, mem_total_mib=3.0, mem_used_mib=4.0, timestamp=5)
+    api_metrics = Metrics(
+        cpu_count=1.0,
+        cpu_used_pct=2.0,
+        mem_total_mib=3.0,
+        mem_used_mib=4.0,
+        timestamp=5,
+    )
     m = MetricsModelConverter.to_sandbox_metrics(api_metrics)
     assert m.cpu_used_percentage == 2.0
 
@@ -168,3 +252,20 @@ def test_sandbox_model_converter_to_api_create_request_and_renew_tz() -> None:
 
     renew = SandboxModelConverter.to_api_renew_request(datetime(2025, 1, 1))
     assert renew.expires_at.tzinfo is timezone.utc
+
+
+def test_sandbox_model_converter_omits_timeout_for_manual_cleanup() -> None:
+    req = SandboxModelConverter.to_api_create_sandbox_request(
+        spec=SandboxImageSpec("python:3.11"),
+        entrypoint=["/bin/sh"],
+        env={},
+        metadata={},
+        timeout=None,
+        resource={"cpu": "100m"},
+        network_policy=None,
+        extensions={},
+        volumes=None,
+    )
+
+    dumped = req.to_dict()
+    assert "timeout" not in dumped

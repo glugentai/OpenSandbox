@@ -33,6 +33,7 @@ import com.alibaba.opensandbox.sandbox.domain.models.execd.executions.CommandLog
 import com.alibaba.opensandbox.sandbox.domain.models.execd.executions.CommandStatus
 import com.alibaba.opensandbox.sandbox.domain.models.execd.executions.Execution
 import com.alibaba.opensandbox.sandbox.domain.models.execd.executions.RunCommandRequest
+import com.alibaba.opensandbox.sandbox.domain.models.execd.executions.RunInSessionRequest
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SandboxEndpoint
 import com.alibaba.opensandbox.sandbox.domain.services.Commands
 import com.alibaba.opensandbox.sandbox.infrastructure.adapters.converter.ExecutionConverter.toApiRunCommandRequest
@@ -48,7 +49,8 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import org.slf4j.LoggerFactory
 
 /**
- * Implementation of [Commands] that adapts OpenAPI-generated [CommandApi].
+ * Implementation of [Commands] that adapts OpenAPI-generated [CommandApi] and
+ * delegates bash session operations to [SessionAdapter].
  *
  * This adapter handles command execution within sandboxes, providing both
  * synchronous and streaming execution modes with proper session management.
@@ -56,6 +58,7 @@ import org.slf4j.LoggerFactory
 internal class CommandsAdapter(
     private val httpClientProvider: HttpClientProvider,
     private val execdEndpoint: SandboxEndpoint,
+    private val sessionAdapter: SessionAdapter,
 ) : Commands {
     companion object {
         private const val RUN_COMMAND_PATH = "/command"
@@ -101,6 +104,7 @@ internal class CommandsAdapter(
                         message = message,
                         statusCode = response.code,
                         error = sandboxError ?: SandboxError(UNEXPECTED_RESPONSE),
+                        requestId = response.header("X-Request-ID"),
                     )
                 }
 
@@ -117,6 +121,14 @@ internal class CommandsAdapter(
                             }
                         }
                 }
+            }
+            if (!request.background) {
+                execution.exitCode =
+                    if (execution.error != null) {
+                        execution.error?.value?.toIntOrNull()
+                    } else {
+                        if (execution.complete != null) 0 else null
+                    }
             }
             return execution
         } catch (e: Exception) {
@@ -182,5 +194,20 @@ internal class CommandsAdapter(
             logger.error("Failed to get command logs", e)
             throw e.toSandboxException()
         }
+    }
+
+    override fun createSession(cwd: String?): String {
+        return sessionAdapter.createSession(cwd)
+    }
+
+    override fun runInSession(
+        sessionId: String,
+        request: RunInSessionRequest,
+    ): Execution {
+        return sessionAdapter.runInSession(sessionId, request)
+    }
+
+    override fun deleteSession(sessionId: String) {
+        sessionAdapter.deleteSession(sessionId)
     }
 }

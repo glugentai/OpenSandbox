@@ -14,6 +14,7 @@
 
 import {
   DEFAULT_ENTRYPOINT,
+  DEFAULT_EGRESS_PORT,
   DEFAULT_EXECD_PORT,
   DEFAULT_HEALTH_CHECK_POLLING_INTERVAL_MILLIS,
   DEFAULT_READY_TIMEOUT_SECONDS,
@@ -22,6 +23,7 @@ import {
 } from "./core/constants.js";
 import { ConnectionConfig, type ConnectionConfigOptions } from "./config/connection.js";
 import type { SandboxFiles } from "./services/filesystem.js";
+import type { Egress } from "./services/egress.js";
 import { createDefaultAdapterFactory } from "./factory/defaultAdapterFactory.js";
 import type { AdapterFactory } from "./factory/adapterFactory.js";
 
@@ -33,6 +35,7 @@ import type {
   CreateSandboxRequest,
   Endpoint,
   NetworkPolicy,
+  NetworkRule,
   RenewSandboxExpirationResponse,
   SandboxId,
   SandboxInfo,
@@ -91,9 +94,9 @@ export interface SandboxCreateOptions {
    */
   resource?: Record<string, string>;
   /**
-   * Sandbox timeout in seconds.
+   * Sandbox timeout in seconds. Set to `null` to require explicit cleanup.
    */
-  timeoutSeconds?: number;
+  timeoutSeconds?: number | null;
 
   /**
    * Skip readiness checks during create/connect.
@@ -187,6 +190,7 @@ export class Sandbox {
       adapterFactory: AdapterFactory;
       lifecycleBaseUrl: string;
       execdBaseUrl: string;
+      egress: Egress;
     }
   >();
 
@@ -201,6 +205,7 @@ export class Sandbox {
     files: SandboxFiles;
     health: ExecdHealth;
     metrics: ExecdMetrics;
+    egress: Egress;
   }) {
     this.id = opts.id;
     this.connectionConfig = opts.connectionConfig;
@@ -208,6 +213,7 @@ export class Sandbox {
       adapterFactory: opts.adapterFactory,
       lifecycleBaseUrl: opts.lifecycleBaseUrl,
       execdBaseUrl: opts.execdBaseUrl,
+      egress: opts.egress,
     });
 
     this.sandboxes = opts.sandboxes;
@@ -254,10 +260,20 @@ export class Sandbox {
       }
     }
 
+    const rawTimeout = opts.timeoutSeconds ?? DEFAULT_TIMEOUT_SECONDS;
+    const timeoutSeconds =
+      opts.timeoutSeconds === null
+        ? null
+        : Math.floor(rawTimeout);
+    if (timeoutSeconds !== null && !Number.isFinite(timeoutSeconds)) {
+      throw new Error(
+        `timeoutSeconds must be a finite number, got ${opts.timeoutSeconds}`
+      );
+    }
+
     const req: CreateSandboxRequest = {
       image: toImageSpec(opts.image),
       entrypoint: opts.entrypoint ?? DEFAULT_ENTRYPOINT,
-      timeout: Math.floor(opts.timeoutSeconds ?? DEFAULT_TIMEOUT_SECONDS),
       resourceLimits: opts.resource ?? DEFAULT_RESOURCE_LIMITS,
       env: opts.env ?? {},
       metadata: opts.metadata ?? {},
@@ -270,6 +286,9 @@ export class Sandbox {
       volumes: opts.volumes,
       extensions: opts.extensions ?? {},
     };
+    if (timeoutSeconds !== null) {
+      req.timeout = timeoutSeconds;
+    }
 
     let sandboxId: SandboxId | undefined;
     try {
@@ -281,7 +300,13 @@ export class Sandbox {
         DEFAULT_EXECD_PORT,
         connectionConfig.useServerProxy
       );
+      const egressEndpoint = await sandboxes.getSandboxEndpoint(
+        sandboxId,
+        DEFAULT_EGRESS_PORT,
+        connectionConfig.useServerProxy
+      );
       const execdBaseUrl = `${connectionConfig.protocol}://${endpoint.endpoint}`;
+      const egressBaseUrl = `${connectionConfig.protocol}://${egressEndpoint.endpoint}`;
 
       const { commands, files, health, metrics } =
         adapterFactory.createExecdStack({
@@ -289,6 +314,11 @@ export class Sandbox {
           execdBaseUrl,
           endpointHeaders: endpoint.headers,
         });
+      const { egress } = adapterFactory.createEgressStack({
+        connectionConfig,
+        egressBaseUrl,
+        endpointHeaders: egressEndpoint.headers,
+      });
 
       const sbx = new Sandbox({
         id: sandboxId,
@@ -301,6 +331,7 @@ export class Sandbox {
         files,
         health,
         metrics,
+        egress,
       });
 
       if (!(opts.skipHealthCheck ?? false)) {
@@ -354,13 +385,24 @@ export class Sandbox {
         DEFAULT_EXECD_PORT,
         connectionConfig.useServerProxy
       );
+      const egressEndpoint = await sandboxes.getSandboxEndpoint(
+        opts.sandboxId,
+        DEFAULT_EGRESS_PORT,
+        connectionConfig.useServerProxy
+      );
       const execdBaseUrl = `${connectionConfig.protocol}://${endpoint.endpoint}`;
+      const egressBaseUrl = `${connectionConfig.protocol}://${egressEndpoint.endpoint}`;
       const { commands, files, health, metrics } =
         adapterFactory.createExecdStack({
           connectionConfig,
           execdBaseUrl,
           endpointHeaders: endpoint.headers,
         });
+      const { egress } = adapterFactory.createEgressStack({
+        connectionConfig,
+        egressBaseUrl,
+        endpointHeaders: egressEndpoint.headers,
+      });
 
       const sbx = new Sandbox({
         id: opts.sandboxId,
@@ -373,6 +415,7 @@ export class Sandbox {
         files,
         health,
         metrics,
+        egress,
       });
 
       if (!(opts.skipHealthCheck ?? false)) {
@@ -486,6 +529,14 @@ export class Sandbox {
     return await this.sandboxes.renewSandboxExpiration(this.id, { expiresAt });
   }
 
+  async getEgressPolicy(): Promise<NetworkPolicy> {
+    return await Sandbox._priv.get(this)!.egress.getPolicy();
+  }
+
+  async patchEgressRules(rules: NetworkRule[]): Promise<void> {
+    await Sandbox._priv.get(this)!.egress.patchRules(rules);
+  }
+
   /**
    * Get sandbox endpoint for a port (STRICT: no scheme), e.g. "localhost:44772" or "domain/route/.../44772".
    */
@@ -511,24 +562,43 @@ export class Sandbox {
     healthCheck?: (sbx: Sandbox) => boolean | Promise<boolean>;
   }): Promise<void> {
     const deadline = Date.now() + opts.readyTimeoutSeconds * 1000;
+    let attempt = 0;
+    let errorDetail = "Health check returned false continuously.";
+
+    const buildTimeoutMessage = () => {
+      const context = `domain=${this.connectionConfig.domain}, useServerProxy=${this.connectionConfig.useServerProxy}`;
+      let suggestion =
+        "If this sandbox runs in Docker bridge or remote-network mode, consider enabling useServerProxy=true.";
+      if (!this.connectionConfig.useServerProxy) {
+        suggestion += " You can also configure server-side [docker].host_ip for direct endpoint access.";
+      }
+      return `Sandbox health check timed out after ${opts.readyTimeoutSeconds}s (${attempt} attempts). ${errorDetail} Connection context: ${context}. ${suggestion}`;
+    };
 
     // Wait until execd becomes reachable and passes health check.
     while (true) {
       if (Date.now() > deadline) {
         throw new SandboxReadyTimeoutException({
-          message: `Sandbox not ready: timed out waiting for health check (timeoutSeconds=${opts.readyTimeoutSeconds})`,
+          message: buildTimeoutMessage(),
         });
       }
+      attempt++;
       try {
         if (opts.healthCheck) {
           const ok = await opts.healthCheck(this);
-          if (ok) return;
+          if (ok) {
+            return;
+          }
         } else {
           const ok = await this.health.ping();
-          if (ok) return;
+          if (ok) {
+            return;
+          }
         }
-      } catch {
-        // ignore and retry
+        errorDetail = "Health check returned false continuously.";
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        errorDetail = `Last health check error: ${message}`;
       }
       await sleep(opts.pollingIntervalMillis);
     }

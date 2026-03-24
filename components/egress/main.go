@@ -16,6 +16,7 @@ package main
 
 import (
 	"context"
+	"net/netip"
 	"os"
 	"os/signal"
 	"strings"
@@ -23,8 +24,10 @@ import (
 
 	"github.com/alibaba/opensandbox/egress/pkg/constants"
 	"github.com/alibaba/opensandbox/egress/pkg/dnsproxy"
+	"github.com/alibaba/opensandbox/egress/pkg/events"
 	"github.com/alibaba/opensandbox/egress/pkg/iptables"
 	"github.com/alibaba/opensandbox/egress/pkg/log"
+	"github.com/alibaba/opensandbox/egress/pkg/policy"
 	slogger "github.com/alibaba/opensandbox/internal/logger"
 	"github.com/alibaba/opensandbox/internal/version"
 )
@@ -38,12 +41,18 @@ func main() {
 	ctx = withLogger(ctx)
 	defer log.Logger.Sync()
 
-	initialRules, err := dnsproxy.LoadPolicyFromEnvVar(constants.EnvEgressRules)
+	initialRules, err := policy.LoadInitialPolicy(os.Getenv(constants.EnvEgressPolicyFile), constants.EnvEgressRules)
 	if err != nil {
-		log.Fatalf("failed to parse %s: %v", constants.EnvEgressRules, err)
+		log.Fatalf("failed to load initial egress policy: %v", err)
 	}
 
 	allowIPs := AllowIPsForNft("/etc/resolv.conf")
+	// Merge nameserver exempt IPs into nft allow set so proxy traffic to them (no SO_MARK) is allowed in dns+nft mode.
+	for _, addr := range dnsproxy.ParseNameserverExemptList() {
+		if !containsAddr(allowIPs, addr) {
+			allowIPs = append(allowIPs, addr)
+		}
+	}
 
 	mode := parseMode()
 	log.Infof("enforcement mode: %s", mode)
@@ -57,7 +66,19 @@ func main() {
 	}
 	log.Infof("dns proxy started on 127.0.0.1:15353")
 
-	if err := iptables.SetupRedirect(15353); err != nil {
+	if blockWebhookURL := strings.TrimSpace(os.Getenv(constants.EnvBlockedWebhook)); blockWebhookURL != "" {
+		blockedBroadcaster := events.NewBroadcaster(ctx, events.BroadcasterConfig{QueueSize: 256})
+		blockedBroadcaster.AddSubscriber(events.NewWebhookSubscriber(blockWebhookURL))
+		proxy.SetBlockedBroadcaster(blockedBroadcaster)
+		defer blockedBroadcaster.Close()
+		log.Infof("denied hostname webhook enabled")
+	}
+
+	exemptDst := dnsproxy.ParseNameserverExemptList()
+	if len(exemptDst) > 0 {
+		log.Infof("nameserver exempt list: %v (proxy upstream in this list will not set SO_MARK)", exemptDst)
+	}
+	if err := iptables.SetupRedirect(15353, exemptDst); err != nil {
 		log.Fatalf("failed to install iptables redirect: %v", err)
 	}
 	log.Infof("iptables redirect configured (OUTPUT 53 -> 15353) with SO_MARK bypass for proxy upstream traffic")
@@ -66,7 +87,7 @@ func main() {
 
 	// start policy server
 	httpAddr := envOrDefault(constants.EnvEgressHTTPAddr, constants.DefaultEgressServerAddr)
-	if err = startPolicyServer(ctx, proxy, nftMgr, mode, httpAddr, os.Getenv(constants.EnvEgressToken), allowIPs); err != nil {
+	if err = startPolicyServer(ctx, proxy, nftMgr, mode, httpAddr, os.Getenv(constants.EnvEgressToken), allowIPs, os.Getenv(constants.EnvEgressPolicyFile)); err != nil {
 		log.Fatalf("failed to start policy server: %v", err)
 	}
 	log.Infof("policy server listening on %s (POST /policy)", httpAddr)
@@ -96,6 +117,15 @@ func isTruthy(v string) bool {
 	default:
 		return false
 	}
+}
+
+func containsAddr(addrs []netip.Addr, a netip.Addr) bool {
+	for _, x := range addrs {
+		if x == a {
+			return true
+		}
+	}
+	return false
 }
 
 func parseMode() string {

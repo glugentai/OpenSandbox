@@ -45,7 +45,7 @@ public class CodeInterpreterE2ETests : IClassFixture<CodeInterpreterE2ETestFixtu
         var metrics = await interpreter.Metrics.GetMetricsAsync();
         Assert.True(metrics.CpuCount > 0);
 
-        var cmd = await interpreter.Commands.RunAsync("echo code-interpreter-ready");
+        var cmd = await RunCommandWithRetryAsync(interpreter, "echo code-interpreter-ready");
         Assert.Null(cmd.Error);
         Assert.Contains(cmd.Logs.Stdout, m => m.Text.Contains("code-interpreter-ready", StringComparison.Ordinal));
     }
@@ -98,12 +98,18 @@ public class CodeInterpreterE2ETests : IClassFixture<CodeInterpreterE2ETestFixtu
 
         var py = await interpreter.Codes.RunAsync("print(1+2)", new RunCodeOptions { Language = SupportedLanguage.Python });
         Assert.Contains(py.Logs.Stdout, s => s.Text.Contains("3", StringComparison.Ordinal));
+        Assert.Null(py.ExitCode);
+        Assert.NotNull(py.Complete);
 
         var js = await interpreter.Codes.RunAsync("console.log(3+4)", new RunCodeOptions { Language = SupportedLanguage.JavaScript });
         Assert.Contains(js.Logs.Stdout, s => s.Text.Contains("7", StringComparison.Ordinal));
+        Assert.Null(js.ExitCode);
+        Assert.NotNull(js.Complete);
 
         var bash = await interpreter.Codes.RunAsync("echo $((8+9))", new RunCodeOptions { Language = SupportedLanguage.Bash });
         Assert.Contains(bash.Logs.Stdout, s => s.Text.Contains("17", StringComparison.Ordinal));
+        Assert.Null(bash.ExitCode);
+        Assert.NotNull(bash.Complete);
     }
 
     [Fact(Timeout = 6 * 60 * 1000)]
@@ -122,18 +128,24 @@ public class CodeInterpreterE2ETests : IClassFixture<CodeInterpreterE2ETestFixtu
                 new RunCodeOptions { Context = javaCtx });
             Assert.Null(javaResult.Error);
             Assert.True(HasText(javaResult, "java-ok") || HasText(javaResult, "5"));
+            Assert.Null(javaResult.ExitCode);
+            Assert.NotNull(javaResult.Complete);
 
             var goResult = await interpreter.Codes.RunAsync(
                 "package main\nimport \"fmt\"\nfunc main(){ fmt.Print(\"go-ok\") }",
                 new RunCodeOptions { Context = goCtx });
             Assert.Null(goResult.Error);
             Assert.True(HasText(goResult, "go-ok"));
+            Assert.Null(goResult.ExitCode);
+            Assert.NotNull(goResult.Complete);
 
             var tsResult = await interpreter.Codes.RunAsync(
                 "console.log('ts-ok'); const n: number = 3 + 4; console.log(n);",
                 new RunCodeOptions { Context = tsCtx });
             Assert.Null(tsResult.Error);
             Assert.True(HasText(tsResult, "ts-ok") || HasText(tsResult, "7"));
+            Assert.Null(tsResult.ExitCode);
+            Assert.NotNull(tsResult.Complete);
         }
         finally
         {
@@ -504,6 +516,62 @@ public class CodeInterpreterE2ETests : IClassFixture<CodeInterpreterE2ETestFixtu
         }
 
         throw lastError ?? new TimeoutException("RunStreamCollectWithRetryAsync failed unexpectedly.");
+    }
+
+    private static async Task<Execution> RunCommandWithRetryAsync(
+        CodeInterpreterClient interpreter,
+        string command,
+        int maxRetries = 3,
+        int perCallTimeoutSeconds = 30)
+    {
+        Exception? lastError = null;
+        Execution? lastResult = null;
+        var delayMs = 1000;
+
+        for (var attempt = 1; attempt <= maxRetries; attempt++)
+        {
+            try
+            {
+                var result = await interpreter.Commands
+                    .RunAsync(command)
+                    .WaitAsync(TimeSpan.FromSeconds(perCallTimeoutSeconds));
+
+                lastResult = result;
+                var hasExpectedStdout = result.Logs.Stdout.Any(log =>
+                    log.Text.Contains("code-interpreter-ready", StringComparison.Ordinal));
+                if (result.Error == null && hasExpectedStdout)
+                {
+                    return result;
+                }
+
+                if (attempt < maxRetries)
+                {
+                    await Task.Delay(delayMs);
+                    delayMs = (int)(delayMs * 1.5);
+                    continue;
+                }
+
+                return result;
+            }
+            catch (Exception ex) when (IsRetryable(ex) && attempt < maxRetries)
+            {
+                lastError = ex;
+                await Task.Delay(delayMs);
+                delayMs = (int)(delayMs * 1.5);
+            }
+            catch (Exception ex)
+            {
+                lastError = ex;
+                break;
+            }
+        }
+
+        if (lastResult != null)
+        {
+            return lastResult;
+        }
+
+        throw lastError ?? new TimeoutException("RunCommandWithRetryAsync failed unexpectedly.");
     }
 
     private static bool IsRetryable(Exception ex)

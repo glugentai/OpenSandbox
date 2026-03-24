@@ -47,10 +47,12 @@ dependencies = [
     "httpx[socks]",
     "kubernetes",
     "pydantic",
+    "redis>=5",
     "pydantic-settings",
     "pyyaml",
     "tomli; python_version < \"3.11\"",
     "uvicorn",
+    "websockets>=14.0",
 ]
 
 [project.urls]

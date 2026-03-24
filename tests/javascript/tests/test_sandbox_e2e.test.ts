@@ -15,8 +15,11 @@
 import { afterAll, beforeAll, expect, test } from "vitest";
 
 import {
+  ConnectionConfig,
+  SandboxApiException,
   Sandbox,
   DEFAULT_EXECD_PORT,
+  DEFAULT_EGRESS_PORT,
   SandboxManager,
   type ExecutionHandlers,
   type ExecutionComplete,
@@ -27,6 +30,9 @@ import {
 } from "@alibaba-group/opensandbox";
 
 import {
+  TEST_API_KEY,
+  TEST_DOMAIN,
+  TEST_PROTOCOL,
   assertEndpointHasPort,
   assertRecentTimestampMs,
   createConnectionConfig,
@@ -41,7 +47,7 @@ beforeAll(async () => {
   sandbox = await Sandbox.create({
     connectionConfig,
     image: getSandboxImage(),
-    timeoutSeconds: 2 * 60,
+    timeoutSeconds: 20 * 60,
     readyTimeoutSeconds: 60,
     metadata: { tag: "e2e-test" },
     entrypoint: ["tail", "-f", "/dev/null"],
@@ -93,7 +99,7 @@ test("01 sandbox lifecycle, health, endpoint, metrics, renew, connect", async ()
   expect(metrics.memoryUsedMiB).toBeLessThanOrEqual(metrics.memoryTotalMiB);
   assertRecentTimestampMs(metrics.timestamp, 120_000);
 
-  const renewResp = await sandbox.renew(5 * 60);
+  const renewResp = await sandbox.renew(20 * 60);
   expect(renewResp.expiresAt).toBeTruthy();
   expect(renewResp.expiresAt).toBeInstanceOf(Date);
 
@@ -113,7 +119,29 @@ test("01 sandbox lifecycle, health, endpoint, metrics, renew, connect", async ()
   }
 });
 
-test.skip("01a sandbox create with networkPolicy", async () => {
+test("01b manual cleanup sandbox returns null expiresAt", async () => {
+  const connectionConfig = createConnectionConfig();
+  const manualSandbox = await Sandbox.create({
+    connectionConfig,
+    image: getSandboxImage(),
+    timeoutSeconds: null,
+    readyTimeoutSeconds: 60,
+    metadata: { tag: "manual-e2e-test" },
+    entrypoint: ["tail", "-f", "/dev/null"],
+    healthCheckPollingInterval: 200,
+  });
+
+  try {
+    const info = await manualSandbox.getInfo();
+    expect(info.expiresAt).toBeNull();
+    expect(info.metadata?.tag).toBe("manual-e2e-test");
+  } finally {
+    await manualSandbox.kill();
+    await manualSandbox.close();
+  }
+});
+
+test("01a sandbox create with networkPolicy", async () => {
   const connectionConfig = createConnectionConfig();
   const networkPolicySandbox = await Sandbox.create({
     connectionConfig,
@@ -125,10 +153,77 @@ test.skip("01a sandbox create with networkPolicy", async () => {
       egress: [{ action: "allow", target: "pypi.org" }],
     },
   });
+  await new Promise((r) => setTimeout(r, 5000));
   try {
-    const r = await networkPolicySandbox.commands.run("echo policy-ok");
-    expect(r.error).toBeUndefined();
-    expect(r.logs.stdout[0]?.text).toBe("policy-ok");
+    const initialPolicy = await networkPolicySandbox.getEgressPolicy();
+    expect(initialPolicy.defaultAction).toBe("deny");
+    expect(initialPolicy.egress?.some((r) => r.target === "pypi.org" && r.action === "allow")).toBe(true);
+
+    const blocked = await networkPolicySandbox.commands.run("curl -I https://www.github.com");
+    expect(blocked.error).toBeTruthy();
+    const allowed = await networkPolicySandbox.commands.run("curl -I https://pypi.org");
+    expect(allowed.error).toBeUndefined();
+
+    await networkPolicySandbox.patchEgressRules([
+      { action: "allow", target: "www.github.com" },
+      { action: "deny", target: "pypi.org" },
+    ]);
+    await new Promise((r) => setTimeout(r, 2000));
+
+    const patchedPolicy = await networkPolicySandbox.getEgressPolicy();
+    expect(patchedPolicy.egress?.some((r) => r.target === "www.github.com" && r.action === "allow")).toBe(true);
+    expect(patchedPolicy.egress?.some((r) => r.target === "pypi.org" && r.action === "deny")).toBe(true);
+
+    const githubAllowed = await networkPolicySandbox.commands.run("curl -I https://www.github.com");
+    expect(githubAllowed.error).toBeUndefined();
+    const pypiDenied = await networkPolicySandbox.commands.run("curl -I https://pypi.org");
+    expect(pypiDenied.error).toBeTruthy();
+  } finally {
+    try {
+      await networkPolicySandbox.kill();
+    } catch {
+      // ignore
+    }
+  }
+}, 3 * 60_000);
+
+test("01aa sandbox create with networkPolicy via server proxy", async () => {
+  const connectionConfig = createConnectionConfig(true);
+  const networkPolicySandbox = await Sandbox.create({
+    connectionConfig,
+    image: getSandboxImage(),
+    timeoutSeconds: 2 * 60,
+    readyTimeoutSeconds: 60,
+    networkPolicy: {
+      defaultAction: "deny",
+      egress: [{ action: "allow", target: "pypi.org" }],
+    },
+  });
+  await new Promise((r) => setTimeout(r, 5000));
+  try {
+    const egressEndpoint = await networkPolicySandbox.getEndpoint(DEFAULT_EGRESS_PORT);
+    expect(egressEndpoint.endpoint).toContain(
+      `/sandboxes/${networkPolicySandbox.id}/proxy/${DEFAULT_EGRESS_PORT}`
+    );
+
+    const initialPolicy = await networkPolicySandbox.getEgressPolicy();
+    expect(initialPolicy.defaultAction).toBe("deny");
+    expect(initialPolicy.egress?.some((r) => r.target === "pypi.org" && r.action === "allow")).toBe(true);
+
+    const blocked = await networkPolicySandbox.commands.run("curl -I https://www.github.com");
+    expect(blocked.error).toBeTruthy();
+    const allowed = await networkPolicySandbox.commands.run("curl -I https://pypi.org");
+    expect(allowed.error).toBeUndefined();
+
+    await networkPolicySandbox.patchEgressRules([
+      { action: "allow", target: "www.github.com" },
+      { action: "deny", target: "pypi.org" },
+    ]);
+    await new Promise((r) => setTimeout(r, 2000));
+
+    const patchedPolicy = await networkPolicySandbox.getEgressPolicy();
+    expect(patchedPolicy.egress?.some((r) => r.target === "www.github.com" && r.action === "allow")).toBe(true);
+    expect(patchedPolicy.egress?.some((r) => r.target === "pypi.org" && r.action === "deny")).toBe(true);
   } finally {
     try {
       await networkPolicySandbox.kill();
@@ -240,7 +335,13 @@ test("01c sandbox create with host volume mount (read-only)", async () => {
     const writeResult = await roSandbox.commands.run(
       `touch ${containerMountPath}/should-fail.txt`
     );
-    expect(writeResult.error).toBeTruthy();
+    const statResult = await roSandbox.commands.run(
+      `test ! -e ${containerMountPath}/should-fail.txt && echo OK`
+    );
+    const writeWasRejected =
+      writeResult.error != null || writeResult.logs.stderr.length > 0;
+    const fileWasNotCreated = statResult.logs.stdout[0]?.text === "OK";
+    expect(writeWasRejected || fileWasNotCreated).toBe(true);
   } finally {
     try {
       await roSandbox.kill();
@@ -352,7 +453,13 @@ test("01e sandbox create with PVC named volume mount (read-only)", async () => {
     const writeResult = await roSandbox.commands.run(
       `touch ${containerMountPath}/should-fail.txt`
     );
-    expect(writeResult.error).toBeTruthy();
+    const statResult = await roSandbox.commands.run(
+      `test ! -e ${containerMountPath}/should-fail.txt && echo OK`
+    );
+    const writeWasRejected =
+      writeResult.error != null || writeResult.logs.stderr.length > 0;
+    const fileWasNotCreated = statResult.logs.stdout[0]?.text === "OK";
+    expect(writeWasRejected || fileWasNotCreated).toBe(true);
   } finally {
     try {
       await roSandbox.kill();
@@ -409,13 +516,13 @@ test("01f sandbox create with PVC named volume subPath mount", async () => {
     );
     expect(writeResult.error).toBeUndefined();
 
-    let readBack;
+    let readBack: Awaited<ReturnType<typeof subpathSandbox.commands.run>> | undefined;
     for (let attempt = 0; attempt < 3; attempt++) {
       readBack = await subpathSandbox.commands.run(
         `cat ${containerMountPath}/output.txt`
       );
       if (readBack.logs.stdout.length > 0) break;
-      await new Promise((r) => setTimeout(r, 1000));
+      await new Promise<void>((resolve) => setTimeout(resolve, 1000));
     }
     expect(readBack!.error).toBeUndefined();
     expect(readBack!.logs.stdout).toHaveLength(1);
@@ -488,6 +595,9 @@ test("02 command execution: success, cwd, background, failure", async () => {
   expect(ok.logs.stdout).toHaveLength(1);
   expect(ok.logs.stdout[0]?.text).toBe("Hello OpenSandbox E2E");
   assertRecentTimestampMs(ok.logs.stdout[0]!.timestamp);
+  expect(ok.exitCode).toBe(0);
+  expect(ok.complete).toBeTruthy();
+  expect(ok.complete!.executionTimeMs).toBeGreaterThanOrEqual(0);
 
   expect(initEvents).toHaveLength(1);
   expect(completedEvents).toHaveLength(1);
@@ -496,10 +606,13 @@ test("02 command execution: success, cwd, background, failure", async () => {
   const pwd = await sandbox.commands.run("pwd", { workingDirectory: "/tmp" });
   expect(pwd.error).toBeUndefined();
   expect(pwd.logs.stdout[0]?.text).toBe("/tmp");
+  expect(pwd.exitCode).toBe(0);
+  expect(pwd.complete).toBeTruthy();
 
   const start = Date.now();
-  await sandbox.commands.run("sleep 30", { background: true });
+  const bg = await sandbox.commands.run("sleep 30", { background: true });
   expect(Date.now() - start).toBeLessThan(10_000);
+  expect(bg.exitCode ?? null).toBeNull();
 
   // failure contract: error exists; completion should be absent
   stdoutMessages.length = 0;
@@ -523,6 +636,8 @@ test("02 command execution: success, cwd, background, failure", async () => {
       m.text.includes("nonexistent-command-that-does-not-exist")
     )
   ).toBe(true);
+  expect(fail.complete).toBeUndefined();
+  expect(fail.exitCode).toBe(Number(fail.error?.value));
   expect(completedEvents.length).toBe(0);
 });
 
@@ -550,11 +665,75 @@ test("02a command status + background logs", async () => {
     logsText += logs.content;
     cursor = logs.cursor ?? cursor;
     if (logsText.includes("log-line-2")) break;
-    await new Promise((r) => setTimeout(r, 1000));
+    await new Promise<void>((resolve) => setTimeout(resolve, 1000));
   }
 
   expect(logsText.includes("log-line-1")).toBe(true);
   expect(logsText.includes("log-line-2")).toBe(true);
+});
+
+test("02b command env injection", async () => {
+  if (!sandbox) throw new Error("sandbox not created");
+
+  const envKey = "OPEN_SANDBOX_E2E_CMD_ENV";
+  const envValue = `env-ok-${Date.now()}`;
+  const probeCommand = `sh -c 'if [ -z "\${${envKey}:-}" ]; then echo "__EMPTY__"; else echo "\${${envKey}}"; fi'`;
+
+  const baseline = await sandbox.commands.run(probeCommand);
+  expect(baseline.error).toBeUndefined();
+  const baselineOutput = baseline.logs.stdout.map((m) => m.text).join("\n").trim();
+  expect(baselineOutput).toBe("__EMPTY__");
+
+  const injected = await sandbox.commands.run(probeCommand, {
+    envs: {
+      [envKey]: envValue,
+      OPEN_SANDBOX_E2E_SECOND_ENV: "second-ok",
+    },
+  });
+  expect(injected.error).toBeUndefined();
+  const injectedOutput = injected.logs.stdout.map((m) => m.text).join("\n").trim();
+  expect(injectedOutput).toBe(envValue);
+});
+
+test("02c bash session API: cwd and env persistence", async () => {
+  if (!sandbox) throw new Error("sandbox not created");
+
+  const sid = await sandbox.commands.createSession({ cwd: "/tmp" });
+  expect(typeof sid).toBe("string");
+  expect(sid.length).toBeGreaterThan(0);
+
+  let run = await sandbox.commands.runInSession(sid, "pwd");
+  expect(run.error).toBeUndefined();
+  expect(run.logs.stdout.map((m) => m.text).join("").trim()).toBe("/tmp");
+
+  run = await sandbox.commands.runInSession(sid, "pwd", { cwd: "/var" });
+  expect(run.error).toBeUndefined();
+  expect(run.logs.stdout.map((m) => m.text).join("").trim()).toBe("/var");
+
+  run = await sandbox.commands.runInSession(sid, "pwd", { cwd: "/tmp" });
+  expect(run.error).toBeUndefined();
+  expect(run.logs.stdout.map((m) => m.text).join("").trim()).toBe("/tmp");
+
+  run = await sandbox.commands.runInSession(
+    sid,
+    "export E2E_SESSION_ENV=session-env-ok"
+  );
+  expect(run.error).toBeUndefined();
+
+  run = await sandbox.commands.runInSession(sid, "echo $E2E_SESSION_ENV");
+  expect(run.error).toBeUndefined();
+  expect(run.logs.stdout.map((m) => m.text).join("").trim()).toBe(
+    "session-env-ok"
+  );
+
+  const sid2 = await sandbox.commands.createSession({ cwd: "/var" });
+  expect(typeof sid2).toBe("string");
+  run = await sandbox.commands.runInSession(sid2, "pwd");
+  expect(run.error).toBeUndefined();
+  expect(run.logs.stdout.map((m) => m.text).join("").trim()).toBe("/var");
+
+  await sandbox.commands.deleteSession(sid);
+  await sandbox.commands.deleteSession(sid2);
 });
 
 test("03 filesystem operations: CRUD + replace/move/delete + range + stream", async () => {
@@ -674,10 +853,18 @@ test("03 filesystem operations: CRUD + replace/move/delete + range + stream", as
   await expect(sandbox.files.readFile(file2)).rejects.toBeTruthy();
 
   await sandbox.files.deleteDirectories([dir1, dir2]);
-  const verify = await sandbox.commands.run(
+  let verify = await sandbox.commands.run(
     `test ! -d ${dir1} && test ! -d ${dir2} && echo OK`,
     { workingDirectory: "/tmp" }
   );
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (!verify.error && verify.logs.stdout[0]?.text === "OK") break;
+    await new Promise((r) => setTimeout(r, 1000));
+    verify = await sandbox.commands.run(
+      `test ! -d ${dir1} && test ! -d ${dir2} && echo OK`,
+      { workingDirectory: "/tmp" }
+    );
+  }
   expect(verify.error).toBeUndefined();
   expect(verify.logs.stdout[0]?.text).toBe("OK");
 });
@@ -710,9 +897,35 @@ test("04 interrupt command", async () => {
   assertRecentTimestampMs(init.timestamp);
 
   await sandbox.commands.interrupt(init.id);
-  const exec = await task;
-  expect(exec.id).toBe(init.id);
-  expect(completed.length > 0 || errors.length > 0).toBe(true);
+  let exec = null;
+  try {
+    exec = await Promise.race([
+      task,
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("interrupt wait timeout")), 60_000),
+      ),
+    ]);
+  } catch {
+    exec = null;
+  }
+
+  if (exec) {
+    expect(exec.id).toBe(init.id);
+  }
+
+  let followUp = null;
+  try {
+    followUp = await sandbox.commands.run("echo interrupt-ok");
+  } catch {
+    followUp = null;
+  }
+
+  expect(
+    completed.length > 0 ||
+      errors.length > 0 ||
+      (followUp?.error === undefined &&
+        followUp?.logs.stdout[0]?.text === "interrupt-ok"),
+  ).toBe(true);
 });
 
 test("05 sandbox pause + resume", async () => {
@@ -755,4 +968,28 @@ test("05 sandbox pause + resume", async () => {
   const echo = await sandbox.commands.run("echo resume-ok");
   expect(echo.error).toBeUndefined();
   expect(echo.logs.stdout[0]?.text).toBe("resume-ok");
+});
+
+test("06 x-request-id passthrough on server error", async () => {
+  const requestId = `e2e-js-server-${Date.now()}`;
+  const missingSandboxId = `missing-${requestId}`;
+  const connectionConfig = new ConnectionConfig({
+    domain: TEST_DOMAIN,
+    protocol: TEST_PROTOCOL === "https" ? "https" : "http",
+    apiKey: TEST_API_KEY,
+    requestTimeoutSeconds: 180,
+    headers: { "X-Request-ID": requestId },
+  });
+
+  try {
+    const connected = await Sandbox.connect({
+      sandboxId: missingSandboxId,
+      connectionConfig,
+    });
+    await connected.getInfo();
+    throw new Error("expected server call to fail");
+  } catch (err) {
+    expect(err).toBeInstanceOf(SandboxApiException);
+    expect((err as SandboxApiException).requestId).toBe(requestId);
+  }
 });

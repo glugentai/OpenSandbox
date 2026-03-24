@@ -50,6 +50,9 @@ GATEWAY_ROUTE_MODE_WILDCARD = "wildcard"
 GATEWAY_ROUTE_MODE_HEADER = "header"
 GATEWAY_ROUTE_MODE_URI = "uri"
 
+EGRESS_MODE_DNS = "dns"
+EGRESS_MODE_DNS_NFT = "dns+nft"
+
 
 def _is_valid_ip(host: str) -> bool:
     try:
@@ -82,6 +85,71 @@ def _is_valid_domain(host: str) -> bool:
 
 def _is_wildcard_domain(host: str) -> bool:
     return bool(_WILDCARD_DOMAIN_RE.match(host))
+
+
+class RenewIntentRedisConfig(BaseModel):
+    """🧪 [EXPERIMENTAL] Redis list consumer for renew-intent queue (ingress gateway path)."""
+
+    enabled: bool = Field(
+        default=False,
+        description=(
+            "🧪 [EXPERIMENTAL] When true, server workers consume renew intents from Redis "
+            "(ingress gateway path)."
+        ),
+    )
+    dsn: Optional[str] = Field(
+        default=None,
+        description=(
+            '🧪 [EXPERIMENTAL] Redis DSN (e.g. "redis://127.0.0.1:6379/0"). '
+            "Required when redis.enabled is true."
+        ),
+    )
+    queue_key: str = Field(
+        default="opensandbox:renew:intent",
+        min_length=1,
+        description="🧪 [EXPERIMENTAL] Redis List key for LPUSH/BRPOP renew-intent JSON payloads.",
+    )
+    consumer_concurrency: int = Field(
+        default=8,
+        ge=1,
+        description="🧪 [EXPERIMENTAL] Number of concurrent BRPOP worker tasks.",
+    )
+
+    @model_validator(mode="after")
+    def require_dsn_when_redis_enabled(self) -> "RenewIntentRedisConfig":
+        if self.enabled and (self.dsn is None or not str(self.dsn).strip()):
+            raise ValueError(
+                "[renew_intent] redis.dsn must be set when redis.enabled is true."
+            )
+        return self
+
+
+class RenewIntentConfig(BaseModel):
+    """🧪 [EXPERIMENTAL] Renew sandbox expiration when access is observed (proxy and/or Redis queue)."""
+
+    enabled: bool = Field(
+        default=False,
+        description=(
+            "🧪 [EXPERIMENTAL] Master switch for auto-renew on reverse-proxy access and/or Redis "
+            "ingress intents. When false, renew-intent logic is off."
+        ),
+    )
+    min_interval_seconds: int = Field(
+        default=60,
+        ge=1,
+        description=(
+            "🧪 [EXPERIMENTAL] Minimum seconds between successful renewals for the same sandbox "
+            "(cooldown)."
+        ),
+    )
+    redis: RenewIntentRedisConfig = Field(
+        default_factory=RenewIntentRedisConfig,
+        description=(
+            "🧪 [EXPERIMENTAL] Redis queue consumer for ingress gateway renew-intent mode. "
+            "In TOML, set keys under the same [renew_intent] table as redis.enabled, "
+            "redis.dsn, redis.queue_key, redis.consumer_concurrency (dotted keys)."
+        ),
+    )
 
 
 class GatewayRouteModeConfig(BaseModel):
@@ -185,6 +253,14 @@ class ServerConfig(BaseModel):
         default=None,
         description="Bound public IP. When set, used as the host part when returning sandbox endpoints.",
     )
+    max_sandbox_timeout_seconds: Optional[int] = Field(
+        default=None,
+        ge=60,
+        description=(
+            "Maximum allowed sandbox TTL in seconds for requests that specify timeout. "
+            "Omit from config to disable the server-side upper bound."
+        ),
+    )
 
 
 class KubernetesRuntimeConfig(BaseModel):
@@ -214,6 +290,38 @@ class KubernetesRuntimeConfig(BaseModel):
         ge=1,
         description=(
             "[Beta] Watch timeout (seconds) before restarting the informer stream."
+        ),
+    )
+    read_qps: float = Field(
+        default=0.0,
+        ge=0,
+        description=(
+            "Maximum read requests per second to the Kubernetes API (get/list). "
+            "0 means unlimited (no rate limiting)."
+        ),
+    )
+    read_burst: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "Burst size for the read rate limiter. "
+            "0 means use read_qps as burst (minimum 1)."
+        ),
+    )
+    write_qps: float = Field(
+        default=0.0,
+        ge=0,
+        description=(
+            "Maximum write requests per second to the Kubernetes API (create/delete/patch). "
+            "0 means unlimited (no rate limiting)."
+        ),
+    )
+    write_burst: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "Burst size for the write rate limiter. "
+            "0 means use write_qps as burst (minimum 1)."
         ),
     )
     namespace: Optional[str] = Field(
@@ -292,6 +400,14 @@ class StorageConfig(BaseModel):
             "Each entry must be an absolute path (e.g., '/data/opensandbox')."
         ),
     )
+    ossfs_mount_root: str = Field(
+        default="/mnt/ossfs",
+        description=(
+            "Host-side root directory where OSSFS mounts are resolved. "
+            "Resolved OSSFS host paths are built as "
+            "'ossfs_mount_root/<bucket>/<volume.subPath?>'."
+        ),
+    )
 
 
 class EgressConfig(BaseModel):
@@ -301,6 +417,13 @@ class EgressConfig(BaseModel):
         default=None,
         description="Container image for the egress sidecar (used when network policy is requested).",
         min_length=1,
+    )
+    mode: Literal[
+        EGRESS_MODE_DNS,
+        EGRESS_MODE_DNS_NFT,
+    ] = Field(
+        default=EGRESS_MODE_DNS,
+        description="Egress enforcement passed to the sidecar as OPENSANDBOX_EGRESS_MODE (dns or dns+nft).",
     )
 
 
@@ -378,9 +501,9 @@ class SecureRuntimeConfig(BaseModel):
 class DockerConfig(BaseModel):
     """Docker runtime specific settings."""
 
-    network_mode: Literal["host", "bridge"] = Field(
+    network_mode: str = Field(
         default="host",
-        description="Docker network mode for sandbox containers (host, bridge, ...).",
+        description="Docker network mode for sandbox containers (host, bridge, or a custom user-defined network name).",
     )
     api_timeout: Optional[int] = Field(
         default=None,
@@ -426,7 +549,7 @@ class DockerConfig(BaseModel):
         ),
     )
     pids_limit: Optional[int] = Field(
-        default=512,
+        default=4096,
         ge=1,
         description="Maximum number of processes allowed per sandbox container. Set to null to disable the limit.",
     )
@@ -436,6 +559,10 @@ class AppConfig(BaseModel):
     """Root application configuration model."""
 
     server: ServerConfig = Field(default_factory=ServerConfig)
+    renew_intent: RenewIntentConfig = Field(
+        default_factory=RenewIntentConfig,
+        description="Auto-renew sandbox expiration when reverse-proxy access is observed.",
+    )
     runtime: RuntimeConfig = Field(..., description="Sandbox runtime configuration.")
     kubernetes: Optional[KubernetesRuntimeConfig] = None
     agent_sandbox: Optional["AgentSandboxRuntimeConfig"] = None
@@ -558,6 +685,8 @@ def get_config_path() -> Path:
 
 __all__ = [
     "AppConfig",
+    "RenewIntentConfig",
+    "RenewIntentRedisConfig",
     "ServerConfig",
     "RuntimeConfig",
     "IngressConfig",
@@ -569,6 +698,8 @@ __all__ = [
     "StorageConfig",
     "KubernetesRuntimeConfig",
     "EgressConfig",
+    "EGRESS_MODE_DNS",
+    "EGRESS_MODE_DNS_NFT",
     "SecureRuntimeConfig",
     "DEFAULT_CONFIG_PATH",
     "CONFIG_ENV_VAR",

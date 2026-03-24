@@ -42,6 +42,12 @@ Pool 自定义资源维护一个预热的计算资源池，以实现快速沙箱
 - 池范围的容量限制，防止资源耗尽
 - 基于需求的自动扩展
 
+## 运行时 API 支持说明
+
+- Kubernetes 运行时当前**不支持** `pause` / `resume` 生命周期 API。
+- 对 Kubernetes 运行时调用这两个 API 会返回 `501 Not Implemented`。
+- OpenSandbox 的 pause/resume 语义是保留容器进程内存态后再恢复；当前 Kubernetes provider 主要覆盖 create/get/list/delete/renew 流程。
+
 
 ## 与 [kubernates-sigs/agent-sandbox](kubernates-sigs/agent-sandbox) 的关系
 
@@ -132,7 +138,7 @@ kind load docker-image <controller-image-name>:<tag>
 kind load docker-image <task-executor-image-name>:<tag>
 ```
 
-例如，如果您使用 `make docker-build IMG=my-controller:latest` 构建镜像，则使用以下命令加载：
+例如，如果您使用 `make docker-build CONTROLLER_IMG=my-controller:latest` 构建镜像，则使用以下命令加载：
 ```sh
 kind load docker-image my-controller:latest
 ```
@@ -235,7 +241,7 @@ helm install opensandbox-controller \
 1. **构建和推送您的镜像：**
    ```sh
    # 构建和推送控制器镜像
-   make docker-build docker-push IMG=<some-registry>/opensandbox-controller:tag
+   make docker-build docker-push CONTROLLER_IMG=<some-registry>/opensandbox-controller:tag
    
    # 构建和推送任务执行器镜像
    make docker-build-task-executor docker-push-task-executor TASK_EXECUTOR_IMG=<some-registry>/opensandbox-task-executor:tag
@@ -283,7 +289,7 @@ helm uninstall opensandbox-controller -n opensandbox-system
 1. **构建和推送您的镜像：**
    ```sh
    # 构建和推送控制器镜像
-   make docker-build docker-push IMG=<some-registry>/opensandbox-controller:tag
+   make docker-build docker-push CONTROLLER_IMG=<some-registry>/opensandbox-controller:tag
    
    # 构建和推送任务执行器镜像
    make docker-build-task-executor docker-push-task-executor TASK_EXECUTOR_IMG=<some-registry>/opensandbox-task-executor:tag
@@ -298,7 +304,7 @@ helm uninstall opensandbox-controller -n opensandbox-system
 
 3. **将管理器部署到集群：**
    ```sh
-   make deploy IMG=<some-registry>/opensandbox-controller:tag TASK_EXECUTOR_IMG=<some-registry>/opensandbox-task-executor:tag
+   make deploy CONTROLLER_IMG=<some-registry>/opensandbox-controller:tag TASK_EXECUTOR_IMG=<some-registry>/opensandbox-task-executor:tag
    ```
 
    **注意**：您可能需要授予自己集群管理员权限或以管理员身份登录以确保您在运行命令之前具有集群管理员权限。

@@ -65,9 +65,39 @@ async def test_run_command_streaming_happy_path_updates_execution() -> None:
     assert execution.id == "exec-1"
     assert execution.logs.stdout[0].text == "hi"
     assert execution.result[0].text == "ok"
+    assert execution.complete is not None
+    assert execution.complete.execution_time_in_millis == 5
+    assert execution.exit_code == 0
 
     assert transport.last_request is not None
     assert transport.last_request.headers.get("accept") == "text/event-stream"
+
+
+@pytest.mark.asyncio
+async def test_run_command_streaming_non_zero_exit_updates_exit_code() -> None:
+    class _ErrorTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            sse = (
+                b'data: {"type":"init","text":"exec-2","timestamp":1}\n\n'
+                b'data: {"type":"error","error":{"ename":"CommandExecError","evalue":"7","traceback":["exit status 7"]},"timestamp":2}\n\n'
+            )
+            return httpx.Response(
+                200,
+                headers={"Content-Type": "text/event-stream"},
+                content=sse,
+                request=request,
+            )
+
+    cfg = ConnectionConfig(protocol="http", transport=_ErrorTransport())
+    endpoint = SandboxEndpoint(endpoint="localhost:44772", port=44772)
+    adapter = CommandsAdapter(cfg, endpoint)
+
+    execution = await adapter.run("exit 7")
+    assert execution.id == "exec-2"
+    assert execution.error is not None
+    assert execution.error.value == "7"
+    assert execution.complete is None
+    assert execution.exit_code == 7
 
 
 @pytest.mark.asyncio

@@ -11,7 +11,7 @@ A production-grade, FastAPI-based service for managing the lifecycle of containe
 - **Pluggable runtimes**:
   - **Docker**: Production-ready
   - **Kubernetes**: Production-ready (see `kubernetes/` for deployment)
-- **Automatic expiration**: Configurable TTL with renewal
+- **Lifecycle cleanup modes**: Configurable TTL with renewal, or manual cleanup with explicit delete
 - **Access control**: API Key authentication (`OPEN-SANDBOX-API-KEY`); can be disabled for local/dev
 - **Networking modes**:
   - Host: shared host network, performance first
@@ -26,6 +26,9 @@ A production-grade, FastAPI-based service for managing the lifecycle of containe
 - **Env/metadata injection**: Per-sandbox environment and metadata
 - **Port resolution**: Dynamic endpoint generation
 - **Structured errors**: Standard error codes and messages
+
+Metadata keys under the reserved prefix `opensandbox.io/` are system-managed
+and cannot be supplied by users.
 
 ## Requirements
 
@@ -88,10 +91,11 @@ Before you start the server, edit the configuration file to suit your environmen
    port = 8080
    log_level = "INFO"
    api_key = "your-secret-api-key-change-this"
+   max_sandbox_timeout_seconds = 86400  # Maximum TTL for requests that specify timeout
 
    [runtime]
    type = "docker"
-   execd_image = "opensandbox/execd:v1.0.6"
+   execd_image = "opensandbox/execd:v1.0.7"
 
    [docker]
    network_mode = "host"  # Containers share host network; only one sandbox instance at a time
@@ -104,10 +108,11 @@ Before you start the server, edit the configuration file to suit your environmen
    port = 8080
    log_level = "INFO"
    api_key = "your-secret-api-key-change-this"
+    max_sandbox_timeout_seconds = 86400  # Maximum TTL for requests that specify timeout
 
    [runtime]
    type = "docker"
-   execd_image = "opensandbox/execd:v1.0.6"
+   execd_image = "opensandbox/execd:v1.0.7"
 
    [docker]
    network_mode = "bridge"  # Isolated container networking
@@ -143,6 +148,26 @@ The returned endpoint is rewritten to the server proxy route:
 
 Reference runtime compose file:
 - `server/docker-compose.example.yaml`
+
+For **experimental** lifecycle options (e.g. auto-renew on access), see [Experimental features](#experimental-features) (after [Configuration reference](#configuration-reference)).
+
+**Sandbox TTL configuration**
+
+- `timeout` requests must be at least 60 seconds.
+- The maximum allowed TTL is controlled by `server.max_sandbox_timeout_seconds`.
+- Omit `timeout` or set it to `null` in the create request to use manual cleanup mode instead of automatic expiration.
+
+**Upgrade order for manual cleanup**
+
+- Existing TTL-only clients can continue to work without changes as long as they do not encounter manual-cleanup sandboxes.
+- Manual cleanup changes the lifecycle response contract: `expiresAt` may be `null`, and other nullable lifecycle fields may also be serialized explicitly as `null`.
+- In practice this can include fields such as `metadata`, `status.reason`, `status.message`, and `status.lastTransitionAt`, depending on the sandbox state and the server response model.
+- Before creating any manual-cleanup sandbox, upgrade every SDK/client that may call `create`, `get`, or `list` on the lifecycle API.
+- Recommended rollout order:
+  1. Upgrade SDKs/clients
+  2. Upgrade the server
+  3. Start creating sandboxes with `timeout` omitted or `null`
+- Do not introduce manual-cleanup sandboxes into a shared environment while old SDKs are still actively reading lifecycle responses.
 
 **Security hardening (applies to all Docker modes)**
    ```toml
@@ -219,7 +244,7 @@ EOF
    ```toml
    [runtime]
    type = "kubernetes"
-   execd_image = "opensandbox/execd:v1.0.5"
+   execd_image = "opensandbox/execd:v1.0.7"
 
    [kubernetes]
    kubeconfig_path = "~/.kube/config"
@@ -232,38 +257,74 @@ EOF
    - Informer settings are **beta** and enabled by default to reduce API calls; set `informer_enabled = false` to turn off.
    - Resync and watch timeouts control how often the cache refreshes; tune for your cluster API limits.
 
-### Egress sidecar for `networkPolicy`
+### Egress configuration
 
-- **Required when using `networkPolicy`**: Configure the sidecar image. The `egress.image` setting is mandatory when requests include `networkPolicy`:
-   ```toml
-   [runtime]
-   type = "docker"
-   execd_image = "opensandbox/execd:v1.0.6"
-   
-   [egress]
-   image = "opensandbox/egress:v1.0.1"
-   ```
-- Supported only in Docker bridge mode; requests with `networkPolicy` are rejected when `network_mode=host` or when `egress.image` is not configured.
-- Main container shares the sidecar netns and explicitly drops `NET_ADMIN`; the sidecar keeps `NET_ADMIN` to manage iptables.
-- IPv6 is disabled in the shared namespace when the egress sidecar is injected to keep policy enforcement consistent.
-- Sidecar image is pulled before start; delete/expire/failure paths attempt to clean up the sidecar as well.
-- Request example (`CreateSandboxRequest` with `networkPolicy`):
-   ```json
-   {
-     "image": {"uri": "python:3.11-slim"},
-     "entrypoint": ["python", "-m", "http.server", "8000"],
-     "timeout": 3600,
-     "resourceLimits": {"cpu": "500m", "memory": "512Mi"},
-     "networkPolicy": {
-       "defaultAction": "deny",
-       "egress": [
-         {"action": "allow", "target": "pypi.org"},
-         {"action": "allow", "target": "*.python.org"}
-       ]
-     }
-   }
-   ```
-- When `networkPolicy` is empty or omitted, no sidecar is injected (allow-all at start).
+The **`[egress]`** block configures the **egress sidecar** image and enforcement mode. The server only starts this sidecar when a sandbox is created **with** a `networkPolicy` (outbound allow/deny rules). If the create request omits `networkPolicy`, no egress sidecar is added and outbound traffic is not restricted by this mechanism.
+
+#### Keys
+
+| Key | Type | Default | Required | Description |
+|-----|------|---------|----------|-------------|
+| `image` | string | — | **Yes** whenever `networkPolicy` is used in a create request | OCI image containing the egress binary. Pulled before the sidecar starts. |
+| `mode` | `dns` or `dns+nft` | `dns` | No | How the sidecar enforces policy. Written to the sidecar as `OPENSANDBOX_EGRESS_MODE` (see below). |
+
+#### `mode` values
+
+- **`dns`**: DNS-based enforcement via the in-sidecar DNS proxy. No nftables layer-2 rules from this path. **CIDR and static IP targets in the policy are not enforced** (use domain-style rules only if you rely on `dns` mode).
+- **`dns+nft`**: Same DNS path, plus nftables where available (see the [egress component README](../components/egress/README.md) for capabilities and fallbacks). **CIDR and static IP allow/deny rules are supported** via nftables when the table is applied successfully.
+
+#### Per-request `networkPolicy`
+
+- Rules are defined on **`CreateSandboxRequest.networkPolicy`** (default action and ordered egress rules: hostnames / patterns, and IP or CIDR entries when using **`dns+nft`**).
+- The serialized policy is passed into the sidecar as **`OPENSANDBOX_EGRESS_RULES`** (JSON).
+- An auth token may be attached for the egress HTTP API; see runtime behavior below.
+
+#### Docker runtime
+
+- **`egress.image` must be set** in config when clients send `networkPolicy`; otherwise the request is rejected.
+- Outbound policy requires **`docker.network_mode = "bridge"`**. Requests with `networkPolicy` are rejected for `network_mode=host` or for user-defined Docker networks that are incompatible with the sidecar attachment model.
+- The main sandbox container shares the sidecar’s network namespace, **drops `NET_ADMIN`**, and relies on the sidecar for policy; the sidecar **keeps `NET_ADMIN`**.
+- **IPv6** is disabled in the shared namespace so allow/deny behavior stays consistent.
+
+#### Kubernetes runtime
+
+- When `networkPolicy` is present, the workload pod includes an **egress** sidecar built from `egress.image`, in addition to the main sandbox container.
+- **`egress.image`** is required in the same way as for Docker.
+
+#### Operational notes
+
+- The sidecar image is pulled (or validated) before start; delete, expiry, and failure paths attempt to remove the sidecar.
+- For deeper behavior (DNS proxy, nftables, limits), refer to the **egress** component documentation under `components/egress/`.
+
+#### Example (`~/.sandbox.toml`)
+
+```toml
+[runtime]
+type = "docker"
+execd_image = "opensandbox/execd:v1.0.7"
+
+[egress]
+image = "opensandbox/egress:v1.0.3"
+mode = "dns"
+```
+
+#### Example create request with `networkPolicy`
+
+```json
+{
+  "image": {"uri": "python:3.11-slim"},
+  "entrypoint": ["python", "-m", "http.server", "8000"],
+  "timeout": 3600,
+  "resourceLimits": {"cpu": "500m", "memory": "512Mi"},
+  "networkPolicy": {
+    "defaultAction": "deny",
+    "egress": [
+      {"action": "allow", "target": "pypi.org"},
+      {"action": "allow", "target": "*.python.org"}
+    ]
+  }
+}
+```
 
 ### Run the server
 
@@ -478,9 +539,10 @@ curl -X DELETE \
 
 ### Egress configuration
 
-| Key           | Type   | Required | Description                    |
-|---------------|--------|----------|--------------------------------|
-| `egress.image` | string | **Required when using `networkPolicy`** | Container image with egress binary. Must be configured when `networkPolicy` is provided in sandbox creation requests. |
+| Key | Type | Default | Required if using `networkPolicy` | Description |
+|-----|------|---------|-----------------------------------|-------------|
+| `egress.image` | string | — | Yes | Egress sidecar image (OCI reference). |
+| `egress.mode` | `dns` \| `dns+nft` | `dns` | No | `OPENSANDBOX_EGRESS_MODE`. CIDR/IP rules need `dns+nft`; `dns` is domain-oriented only. |
 
 ### Docker configuration
 
@@ -503,6 +565,35 @@ curl -X DELETE \
 | `SANDBOX_CONFIG_PATH` | Override config file location |
 | `DOCKER_HOST` | Docker daemon URL (e.g., `unix:///var/run/docker.sock`) |
 | `PENDING_FAILURE_TTL` | TTL for failed pending sandboxes in seconds (default: 3600) |
+
+## Experimental features
+
+Optional **🧪 experimental** capabilities; **off by default** in `server/example.config.toml` and `example.config.*.toml`. Check release notes before production.
+
+### Auto-renew on access
+
+Extends sandbox TTL when access is observed (via the lifecycle **server proxy** and/or **ingress**). Architecture, data flow, and tuning are in **[OSEP-0009](../oseps/0009-auto-renew-sandbox-on-ingress-access.md)**.
+
+**Server on/off**
+
+| Goal | What to do |
+|------|------------|
+| **Off (default)** | Keep `[renew_intent] enabled = false` in `~/.sandbox.toml` (see `example.config.toml`). |
+| **On** | Set `[renew_intent] enabled = true`. For **ingress + Redis** mode, set `redis.enabled = true` and `redis.dsn` in the same `[renew_intent]` table (see OSEP-0009). |
+| **Other keys** | `min_interval_seconds`, `queue_key`, `consumer_concurrency` — see OSEP-0009 and `[renew_intent]` in `example.config.toml`. |
+
+**Per sandbox**
+
+On **create**, set `extensions["access.renew.extend.seconds"]` to a string integer between **300** and **86400** (seconds). Omit the key to opt that sandbox out of renew-on-access (or leave renew_intent disabled globally).
+
+**Clients (SDK / HTTP)**
+
+- **Use the lifecycle server as proxy** so traffic goes to `/v1/sandboxes/{id}/proxy/{port}/...`:
+  - **REST**: request endpoints with `use_server_proxy=true`, e.g. `GET /v1/sandboxes/{id}/endpoints/{port}?use_server_proxy=true`.
+  - **SDK**: `ConnectionConfig(use_server_proxy=True)` or `ConnectionConfigSync(use_server_proxy=True)` (see SDK docs for `use_server_proxy`).
+- **Ingress / gateway** path: deploy and route per OSEP-0009; clients use the gateway as usual.
+
+**Further reading**: [OSEP-0009](../oseps/0009-auto-renew-sandbox-on-ingress-access.md); sample keys under `[renew_intent]` in `server/example.config.toml`.
 
 ## Development
 
