@@ -43,8 +43,8 @@ trust_mitm_ca() {
 		fi
 		return 0
 	fi
-	echo "error: cannot install mitm CA (need update-ca-certificates or update-ca-trust)" >&2
-	exit 1
+	echo "warning: cannot install mitm CA (need update-ca-certificates or update-ca-trust)" >&2
+	return 1
 }
 
 MITM_CA="/opt/opensandbox/mitmproxy-ca-cert.pem"
@@ -58,10 +58,10 @@ if is_truthy "${OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT:-}"; then
 		i=$((i + 1))
 	done
 	if [ ! -f "$MITM_CA" ] || [ ! -s "$MITM_CA" ]; then
-		echo "error: timed out after 10s waiting for $MITM_CA (egress mitm CA export)" >&2
-		exit 1
+		echo "warning: timed out after 10s waiting for $MITM_CA (egress mitm CA export); continuing without system CA trust" >&2
+	elif ! trust_mitm_ca "$MITM_CA"; then
+		echo "warning: failed to install mitm CA into system trust store; TLS interception may not work for system libraries" >&2
 	fi
-	trust_mitm_ca "$MITM_CA"
 fi
 
 EXECD="${EXECD:=/opt/opensandbox/execd}"
@@ -69,7 +69,6 @@ EXECD="${EXECD:=/opt/opensandbox/execd}"
 if [ -z "${EXECD_ENVS:-}" ]; then
 	EXECD_ENVS="/opt/opensandbox/.env"
 fi
-# Best-effort ensure file exists.
 if ! mkdir -p "$(dirname "$EXECD_ENVS")" 2>/dev/null; then
 	echo "warning: failed to create dir for EXECD_ENVS=$EXECD_ENVS" >&2
 fi
