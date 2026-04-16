@@ -28,6 +28,7 @@ import (
 
 	"github.com/alibaba/opensandbox/execd/pkg/jupyter/execute"
 	"github.com/alibaba/opensandbox/execd/pkg/log"
+	"github.com/alibaba/opensandbox/execd/pkg/util/pathutil"
 	"github.com/alibaba/opensandbox/internal/safego"
 )
 
@@ -44,10 +45,14 @@ func (c *Controller) runCommand(ctx context.Context, request *ExecuteCodeRequest
 	startAt := time.Now()
 	log.Info("received command: %v", request.Code)
 	cmd := exec.CommandContext(ctx, "cmd", "/C", request.Code)
+	cwd, err := pathutil.ExpandPath(request.Cwd)
+	if err != nil {
+		return fmt.Errorf("resolve cwd: %w", err)
+	}
 
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
-	cmd.Dir = request.Cwd
+	cmd.Dir = cwd
 	extraEnv := mergeExtraEnvs(loadExtraEnvFromFile(), request.Envs)
 	cmd.Env = mergeEnvs(os.Environ(), extraEnv)
 
@@ -118,8 +123,12 @@ func (c *Controller) runBackgroundCommand(ctx context.Context, cancel context.Ca
 	startAt := time.Now()
 	log.Info("received command: %v", request.Code)
 	cmd := exec.CommandContext(ctx, "cmd", "/C", request.Code)
+	cwd, err := pathutil.ExpandPath(request.Cwd)
+	if err != nil {
+		return fmt.Errorf("resolve cwd: %w", err)
+	}
 
-	cmd.Dir = request.Cwd
+	cmd.Dir = cwd
 	cmd.Stdout = pipe
 	cmd.Stderr = pipe
 	extraEnv := mergeExtraEnvs(loadExtraEnvFromFile(), request.Envs)
